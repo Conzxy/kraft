@@ -1,0 +1,100 @@
+syntax = "proto2";
+
+package kraft;
+
+enum EntryType {
+  ENTRY_NORMAL = 1;
+  ENTRY_CONF = 2;
+}
+
+message Entry
+{
+  required EntryType type = 1;
+  required uint64 term = 2;
+  required uint64 index = 3;
+  optional bytes data = 4;
+}
+
+enum MessageType {
+  MSG_VOTE = 0;
+  MSG_AE = 1;
+  MSG_HEART_BEAT = 2;
+  MSG_ASK_ID = 3;
+  MSG_NO_OP = 4;
+  MSG_VOTE_RES = 5;
+  MSG_AE_RES = 6;
+  MSG_ASK_ID_RES = 7;
+  MSG_HEART_BEAT_RES = 8;
+  MSG_NO_OP_RES = 9;
+}
+
+/*
+message Request
+{
+  required MessageType type = 1;
+  required uint64 term = 2;
+  required uint64 from = 3; // candidate_id for vote; leader_id for append
+  required uint64 to = 4;   // To verify message
+  // last_log_index for vote; prev_log_index for append
+  optional uint64 log_index = 5;
+  // last_log_term for vote; prev_log_term for append
+  optional uint64 log_term = 6;
+  optional uint64 commit = 7; // for append
+  repeated Entry entries = 8; // for append
+}
+
+message Response
+{
+  required MessageType type = 1;
+  optional uint64 term = 2;  // for update leader/candidate itself
+  required bool success = 3; // success for append; vote_granted for vote
+  required uint64 from = 4;
+  required uint64 to = 5;
+  optional uint64 hint = 6;
+}
+*/
+
+message Message
+{
+  required MessageType type = 1;
+  required uint64 term = 2;
+  // request: candidate_id for vote; leader_id for append
+  // response: for update leader/candidate itself
+  required uint64 from = 3;
+  required uint64 to = 4; // To verify message
+  // last_log_index for vote; prev_log_index for append
+  optional uint64 log_index = 5;
+  // last_log_term for vote; prev_log_term for append
+  optional uint64 log_term = 6;
+  optional uint64 commit = 7; // for append
+  repeated Entry entries = 8; // for append
+
+  required bool success = 9; // success for append; vote_granted for vote
+  optional uint64 hint = 10; //
+}
+
+message PersistentState
+{
+  required uint64 term = 1;
+  required uint64 voted_for = 2;
+  required uint64 id = 3;
+  // required uint64 commit = 4; // fast recovery
+}
+
+message ConfState
+{
+  repeated uint64 nodes = 1;
+}
+
+enum ConfChangeType {
+  CONF_CHANGE_ADD_NODE = 0;
+  CONF_CHANGE_REMOVE_NODE = 1;
+  CONF_CHANGE_MODIFY_NODE = 2;
+}
+
+message ConfChange
+{
+  required ConfChangeType type = 1;
+  required uint64 node_id = 2;
+  optional bytes context = 3;
+}
