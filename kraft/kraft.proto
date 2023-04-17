@@ -69,7 +69,7 @@ message Message
   optional uint64 commit = 7; // for append
   repeated Entry entries = 8; // for append
 
-  required bool success = 9; // success for append; vote_granted for vote
+  optional bool success = 9; // success for append; vote_granted for vote
   optional uint64 hint = 10; //
 }
 
@@ -81,10 +81,7 @@ message PersistentState
   // required uint64 commit = 4; // fast recovery
 }
 
-message ConfState
-{
-  repeated uint64 nodes = 1;
-}
+message ConfState { repeated uint64 nodes = 1; }
 
 enum ConfChangeType {
   CONF_CHANGE_ADD_NODE = 0;
