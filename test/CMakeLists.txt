@@ -18,6 +18,7 @@ macro (GenTest SRC)
     get_filename_component(kraft_test_filename ${kraft_test_source} NAME_WE)
     get_filename_component(kraft_test_file_dir ${kraft_test_source} DIRECTORY)
     
+    set(test_sources "")
     list(APPEND test_sources ${kraft_test_source})
     set(proto_file "${kraft_test_file_dir}/${kraft_test_filename}.proto")
     if (EXISTS ${proto_file})
@@ -33,7 +34,11 @@ macro (GenTest SRC)
     endif (${BUILD_ALL_TESTS})
   
     target_link_libraries(${kraft_test_filename} PRIVATE ${ARGN})
-    target_include_directories(${kraft_test_filename} PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+    target_include_directories(
+      ${kraft_test_filename}
+      PRIVATE ${CMAKE_CURRENT_BINARY_DIR}
+      PRIVATE ${PROJECT_SOURCE_DIR}  
+    )
     set_target_properties(${kraft_test_filename}
       PROPERTIES
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/test"
@@ -47,8 +52,8 @@ endmacro()
 find_package(GTest CONFIG REQUIRED)
 find_package(benchmark CONFIG REQUIRED)
 
-set(TEST_LIBS kraft_protobuf)
-set(BENCH_LIBS kraft_protobuf)
+set(TEST_LIBS kraft kraft_protobuf)
+set(BENCH_LIBS kraft kraft_protobuf)
 
 GenTest(KRAFT_TEST_SOURCES GTest::gtest GTest::gtest_main ${TEST_LIBS})
 GenTest(KRAFT_BENCH_SOURCES benchmark benchmark_main ${BENCH_LIBS})
