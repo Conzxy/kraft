@@ -1,5 +1,7 @@
 // SPDX-LICENSE-IDENTIFIER: BSD-2-Clause
-#include "kraft.h"
+//
+// This file is must be included by kraft.cc only
+#include "kraft/kraft.h"
 #include <cassert>
 #include <stdarg.h>
 
@@ -9,19 +11,21 @@ struct Raft::RaftImpl {
   static void Log(Raft *raft, char const *fmt, ...)
   {
     if (!raft->log_cb_) return;
+
     char buf[4096];
 
-    va_list(args);
+    va_list args;
     va_start(args, fmt);
-    auto writen = vsprintf(buf, fmt, args);
+    const auto writen = vsprintf(buf, fmt, args);
     if (writen < 0) return;
 
     raft->log_cb_(buf, writen);
+    va_end(args);
   }
 
   KRAFT_INLINE static ConfChange MakeConfChange(Raft *raft,
                                                 ConfChangeType conf_type,
-                                                u64 id, void *conf_ctx,
+                                                u64 id, void const *conf_ctx,
                                                 size_t conf_ctx_len)
   {
     ConfChange conf_chg;
@@ -50,10 +54,12 @@ struct Raft::RaftImpl {
   KRAFT_INLINE static bool CheckResponseTerm(Raft *raft,
                                              Response const &response)
   {
+    // Peer's term is newer than me,
+    // indicates I'm might a stale leader/candidate.
     if (response.term() > raft->term()) {
-      raft->SetTerm(response.term());
-      raft->BecomeFollower();
-      return true;
+      SetTerm(raft, response.term());
+      if (!raft->IsFollower()) raft->BecomeFollower();
+      return true; // to stop process, update state
     }
     return false;
   }
@@ -67,13 +73,13 @@ struct Raft::RaftImpl {
       response->set_term(raft->term());
       Log(raft, "Peer term < current term");
       raft->send_message_cb_(response, ctx);
-      return true;
+      return true; // to stop process, peer is a stale candidate/leader
     }
 
     // new leader has later term is OK.
     if (request.term() > raft->term()) {
       Log(raft, "Peer term > current term");
-      raft->SetTerm(raft->term());
+      SetTerm(raft, raft->term());
     }
     return false;
   }
@@ -95,10 +101,25 @@ struct Raft::RaftImpl {
   KRAFT_INLINE static Request MakeRequest(Raft *raft, MessageType type)
   {
     Request request;
+
+    KRAFT_ASSERT(raft->self_node_.id != INVALID_ID,
+                 "The message's id can't be invalid for request");
     request.set_from(raft->self_node_.id);
     request.set_type(type);
     request.set_term(raft->term());
     return request;
+  }
+
+  KRAFT_INLINE static Response MakeResponse(Raft *raft, Request const &request)
+  {
+    Response response;
+
+    KRAFT_ASSERT(raft->self_node_.if != INVALID_ID,
+                 "The message's id can'bt invalid for response");
+    response.set_from(raft->self_node_.id);
+    response.set_type(request.type());
+    response.set_term(raft->term());
+    return response;
   }
 
   KRAFT_INLINE static void SendVoteRequestAll(Raft *raft)
@@ -106,11 +127,17 @@ struct Raft::RaftImpl {
     const auto last_entry_info = raft->log_get_last_entry_meta_cb_();
     Request req;
     req.set_type(MSG_VOTE);
+    KRAFT_ASSERT(raft->self_node_.id != INVALID_ID,
+                 "The VoteRequest id can't be invalid");
     req.set_from(raft->self_node_.id);
+
+    // Used for checking whether the log is up-to-date or not
     req.set_log_index(last_entry_info.index);
     req.set_log_term(last_entry_info.term);
+
     req.set_term(raft->term());
     for (auto &peer_node : raft->peer_nodes_) {
+      // FIXME voting
       if (peer_node.IsActive()) {
         req.set_to(peer_node.id);
         KRAFT_ASSERT1(raft->send_message_cb_);
@@ -133,6 +160,8 @@ struct Raft::RaftImpl {
   KRAFT_INLINE static Raft::ErrorCode AppendLogEntry(Raft *raft, EntryType type,
                                                      void const *data, u64 n)
   {
+    KRAFT_ASSERT(raft->IsLeader(), "Only leader can send AE request");
+
     Entry last_entry = MakeEntry(raft, type, data, n);
     const auto last_entry_index = last_entry.index();
     if (!raft->log_append_entry_cb_(last_entry)) {
@@ -144,23 +173,31 @@ struct Raft::RaftImpl {
                  "The appened log entry must has current term");
     Request request = MakeRequest(raft, MSG_AE);
     request.set_commit(raft->commit_);
+
+    // FIXME send size
     for (u64 i = 0; i < raft->peer_nodes_.size(); ++i) {
       auto &node = raft->peer_nodes_[i];
+      // FIXME voting
       if (!node.IsActive()) {
         continue;
       }
 
       request.set_to(node.id);
       u64 start_idx = raft->next_indices_[i];
+      KRAFT_ASSERT(start_idx >= 1, "The next index must >= 1");
+
+      // log index previous new logs
       request.set_log_index(start_idx - 1);
       // FIXME cache term?
-      auto prev_entry_term = raft->log_get_entry_meta_cb_(start_idx - 1);
+      const auto prev_entry_term = raft->log_get_entry_meta_cb_(start_idx - 1);
       request.set_log_term(prev_entry_term);
+
       request.mutable_entries()->Reserve(last_entry_index - start_idx + 1);
-      KRAFT_ASSERT1(get_log_entry_cb_);
       for (; start_idx <= last_entry_index; ++start_idx) {
-        if (!raft->log_get_entry_cb_(start_idx,
-                                     request.mutable_entries()->Add())) {
+        request.mutable_entries()->Add();
+        Entry const *p_entry = *(--request.mutable_entries()->pointer_end());
+        // auto request.mutable_entries()->Add();
+        if (!raft->log_get_entry_cb_(start_idx, &p_entry)) {
           Log(raft, "Failed to get log entry in %llu", start_idx);
           return E_LOG_GET_ENTRY;
         }
@@ -175,6 +212,8 @@ struct Raft::RaftImpl {
   FillAppendEntriesRequest(Raft *raft, Request *request, u64 start_idx,
                            u64 last_entry_index)
   {
+    KRAFT_ASSERT(raft->IsLeader(), "Only leader can fill AE request");
+
     request->set_log_index(start_idx - 1);
     // FIXME cache term?
     auto prev_entry_term = raft->log_get_entry_meta_cb_(start_idx - 1);
@@ -182,8 +221,9 @@ struct Raft::RaftImpl {
     request->mutable_entries()->Reserve(last_entry_index - start_idx + 1);
     KRAFT_ASSERT1(get_log_entry_cb_);
     for (; start_idx <= last_entry_index; ++start_idx) {
-      if (!raft->log_get_entry_cb_(start_idx,
-                                   request->mutable_entries()->Add())) {
+      request->mutable_entries()->Add();
+      Entry const *p_entry = *(--request->mutable_entries()->pointer_end());
+      if (!raft->log_get_entry_cb_(start_idx, &p_entry)) {
         Log(raft, "Failed to get log entry in %llu", start_idx);
         return E_LOG_GET_ENTRY;
       }
@@ -193,7 +233,7 @@ struct Raft::RaftImpl {
 
   KRAFT_INLINE static ErrorCode AppendConfLogEntry(Raft *raft,
                                                    ConfChangeType type, u64 id,
-                                                   void *conf_ctx,
+                                                   void const *conf_ctx,
                                                    u64 conf_ctx_len)
   {
     auto conf_chg =
@@ -205,7 +245,10 @@ struct Raft::RaftImpl {
 
   KRAFT_INLINE static Raft::ErrorCode ApplyEntries(Raft *raft)
   {
-    Entry apply_entry;
+    KRAFT_ASSERT(raft->last_applied_ <= raft->commit_,
+                 "The last applied index must be <= commit index");
+
+    Entry const *apply_entry = nullptr;
     for (u64 i = raft->last_applied_ + 1; i < raft->commit_; ++i) {
       if (!raft->log_get_entry_cb_(i, &apply_entry)) {
         Log(raft, "Failed to get log entry in %llu when apply entries", i);
@@ -214,11 +257,12 @@ struct Raft::RaftImpl {
 
       // User should implement how to apply conf change entry and
       // normal entry(user-defined data)
-      if (!raft->log_apply_entry_cb_(&apply_entry)) {
+      if (!raft->log_apply_entry_cb_(apply_entry)) {
         Log(raft, "Failed to apply log entry in %llu", i);
         return E_LOG_APPLY;
       }
 
+      // FIXME Support roll back or allow partial applied?
       raft->last_applied_++;
     }
 
@@ -229,9 +273,9 @@ struct Raft::RaftImpl {
     return E_OK;
   }
 
+  // To expand, make LogState() as a single function call
   KRAFT_INLINE static bool LogState(Raft *raft)
   {
-    // To expand
     if (!raft->log_set_state_(raft->persistent_state_)) {
       Log(raft,
           "Failed to log state, old state is: (term: %llu, voted_for: %llu, "
@@ -246,7 +290,6 @@ struct Raft::RaftImpl {
   {
     /* Leader Rule 4 */
 
-    u64 match_num = 1; // self
     auto last_entry_meta = raft->log_get_last_entry_meta_cb_();
 
     // The last entry has the maximum index, its term is old term entry
@@ -254,6 +297,7 @@ struct Raft::RaftImpl {
 
     for (u64 test_index = last_entry_meta.index; test_index > raft->commit_;) {
       bool is_majority = false;
+      u64 match_num = 1; // self
       for (u64 i = 0; i < raft->peer_nodes_.size(); ++i) {
         if (!raft->peer_nodes_[i].IsActive()) continue;
 
@@ -280,5 +324,29 @@ struct Raft::RaftImpl {
     }
 
     return E_OK;
+  }
+
+  KRAFT_INLINE static ErrorCode AppendNoOpLogEntry(Raft *raft)
+  {
+    return AppendLogEntry(raft, ENTRY_NORMAL, nullptr, 0);
+  }
+
+  // Should be call only once
+  KRAFT_INLINE static void SetId(Raft *raft, u64 id)
+  {
+    raft->persistent_state_.set_id(id);
+    LogState(raft);
+  }
+
+  KRAFT_INLINE static void SetVotedFor(Raft *raft, u64 id)
+  {
+    raft->persistent_state_.set_voted_for(id);
+    LogState(raft);
+  }
+
+  KRAFT_INLINE static void SetTerm(Raft *raft, u64 term)
+  {
+    raft->persistent_state_.set_term(term);
+    LogState(raft);
   }
 };

@@ -3,19 +3,25 @@
 #define _KRAFT_H__
 
 #include <cstdint>
-#include <vector>
 #include <functional>
+#include <vector>
 
-//#include ""
-#include "type.h"
+// #include ""
 #include "kraft.pb.h"
-#include "macro.h"
+#include "kraft/macro.h"
+#include "kraft/type.h"
 
 namespace kraft {
 
+// Dummy type to distinguish the request
+// and response of raft message
+//
+// The usage is explained by user
 using Request = Message;
 using Response = Message;
 
+// Don't use macro to represent const variable
+// unnamed enum is a good replacement.
 enum : u64 {
   INVALID_TERM = (u64)-1,
   INVALID_INDEX = (u64)-1,
@@ -23,16 +29,12 @@ enum : u64 {
   INVALID_ID = (u64)-1,
 };
 
+// NOTE: HB: Heart Beat
 enum NodeFlag : u8 {
-  NODE_NONE = 0,
-  NODE_ACTIVE = 1,
+  NODE_NONE = 0,   // INVALID state
+  NODE_ACTIVE = 1, // HB Request is OK
   NODE_VOTING = (1 << 1),
   NODE_RECV_HARTBEAT = (1 << 2),
-};
-
-struct EntryMeta {
-  u64 term = -1;
-  u64 index = -1;
 };
 
 struct Node {
@@ -43,22 +45,16 @@ struct Node {
   Node() = default;
 
   // Just used for perfect forwarding.
-  Node(u64 id_, void *ctx_, u8 flag_)
+  Node(u64 id_, void *ctx_, u8 flag_ = NODE_NONE) noexcept
     : id(id_)
     , ctx(ctx_)
     , flag(flag_)
   {
   }
 
-  KRAFT_INLINE bool IsActive() const noexcept
-  {
-    return flag & NODE_ACTIVE;
-  }
+  KRAFT_INLINE bool IsActive() const noexcept { return flag & NODE_ACTIVE; }
 
-  KRAFT_INLINE bool IsVoting() const noexcept
-  {
-    return flag & NODE_VOTING;
-  }
+  KRAFT_INLINE bool IsVoting() const noexcept { return flag & NODE_VOTING; }
 
   KRAFT_INLINE bool IsRecvHeartBeat() const noexcept
   {
@@ -66,8 +62,12 @@ struct Node {
   }
 };
 
+/**
+ * Represents a Raft Instance
+ */
 class Raft {
  public:
+  // FIXME init state?
   enum class RaftState {
     FOLLOWER = 0,
     CANDIDATE,
@@ -76,11 +76,11 @@ class Raft {
 
   enum ErrorCode {
     E_OK = 0,
-    E_NODE_NONEXISTS = 1,
-    E_INVALID_REQUEST = 2,
-    E_INVALID_RESPONSE = 3,
-    E_INCORRECT_STATE = 4,
-    E_NOT_ONLY_LEADER = 5,
+    E_NODE_NONEXISTS,
+    E_INVALID_REQUEST,
+    E_INVALID_RESPONSE,
+    E_INCORRECT_STATE,
+    E_NOT_ONLY_LEADER,
     E_INCORRECT_TO_NODE,
     E_INCORRECT_FROM_NODE,
     E_TRUNCATE,
@@ -89,10 +89,15 @@ class Raft {
     E_LOG_GET_ENTRY,
     E_LOG_APPLY,
     E_ADD_PEER_NODE,
+    E_ERR_NUM_,
   };
+
+  static constexpr char const *ErrorCode2Str(ErrorCode e) noexcept;
 
   explicit Raft(size_t peer_node_num = 0);
   ~Raft() noexcept;
+
+  // FIXME move operation
 
   KRAFT_DISABLE_COPY(Raft);
 
@@ -100,8 +105,8 @@ class Raft {
   /* Node control                                     */
   /*--------------------------------------------------*/
 
-  bool AddPeerNode(u64 id, void *user_ctx, void *conf_ctx, size_t conf_ctx_len);
-  bool AddSelfNode(u64 id, void *user_ctx, void *conf_ctx, size_t conf_ctx_len);
+  bool AddPeerNode(u64 id, void *user_ctx);
+  bool AddSelfNode(u64 id, void *user_ctx = nullptr);
 
   ErrorCode AskNodeId(void *user_ctx);
   ErrorCode RecvAskNodeResponse(Response &response, void *user_ctx);
@@ -119,6 +124,7 @@ class Raft {
   /*--------------------------------------------------*/
 
   ErrorCode AppendLog(void const *data, size_t n);
+  ErrorCode AppendConfChangeLog(u64 id, void const *conf_ctx, size_t n);
 
   ErrorCode RecvVoteResponse(Response &rsp);
   ErrorCode RecvVoteRequest(Request &req);
@@ -149,35 +155,23 @@ class Raft {
   void BecomeFollower();
   void BecomeCandidate();
 
-  KRAFT_INLINE RaftState state() const noexcept
-  {
-    return state_;
-  }
+  KRAFT_INLINE RaftState state() const noexcept { return state_; }
 
-  KRAFT_INLINE u64 term() const noexcept
-  {
-    return persistent_state_.term();
-  }
+  KRAFT_INLINE u64 term() const noexcept { return persistent_state_.term(); }
 
   KRAFT_INLINE u64 voted_for() const noexcept
   {
     return persistent_state_.voted_for();
   }
 
-  KRAFT_INLINE u64 id() const noexcept
-  {
-    return persistent_state_.id();
-  }
+  KRAFT_INLINE u64 id() const noexcept { return persistent_state_.id(); }
 
   KRAFT_INLINE bool IsMajorityVoted() const noexcept
   {
     return voted_num_ > ((peer_nodes_.size() + 1) >> 1);
   }
 
-  KRAFT_INLINE u64 leader_id() const noexcept
-  {
-    return leader_id_;
-  }
+  KRAFT_INLINE u64 leader_id() const noexcept { return leader_id_; }
 
   KRAFT_INLINE void *leader_context() noexcept
   {
@@ -193,11 +187,6 @@ class Raft {
   }
 
  private:
-  // Should be call only once
-  void SetId(u64 id);
-  void SetVotedFor(u64 id);
-  void SetTerm(u64 term);
-
   friend struct RaftImpl;
   struct RaftImpl;
 
@@ -222,10 +211,17 @@ class Raft {
   std::vector<u64> next_indices_;
   std::vector<u64> match_indices_;
 
-  // callback
  public:
-  std::function<void(char const *, size_t)> log_cb_;
+  /*--------------------------------------------------*/
+  /* Log Callback(for debug)                          */
+  /*--------------------------------------------------*/
+
+  std::function<void(char const *data, size_t n)> log_cb_;
   std::function<void()> flush_cb_;
+
+  /*--------------------------------------------------*/
+  /* Log storage Engine Callback(for log entry)       */
+  /*--------------------------------------------------*/
 
   // Log storage engine interface.
   // I use callback as it is more flexible than virtual function.
@@ -233,16 +229,28 @@ class Raft {
   // The performance of std::function<> and virtual function is likely
   // same(Release mode).
   // YOU don't care the performance problem.
+
+  // Storage layer
   std::function<bool(Entry const &entry)> log_append_entry_cb_;
   std::function<bool(PersistentState const &state)> log_set_state_;
   std::function<EntryMeta()> log_get_last_entry_meta_cb_;
   std::function<u64(u64 index)> log_get_entry_meta_cb_;
   std::function<bool(u64 index)> log_truncate_after_cb_;
-  std::function<bool(u64 index, Entry *entry)> log_get_entry_cb_;
-  std::function<bool(Entry *)> log_apply_entry_cb_;
+
+  // User must ensure this point is valid when call this function
+  // even though in mutlthread environment
+  // \param entry is pointer to a const entry
+  std::function<bool(u64 index, Entry const **entry)> log_get_entry_cb_;
+
+  // Application layer
+  std::function<bool(Entry const *)> log_apply_entry_cb_;
+
+  /*--------------------------------------------------*/
+  /* IO Callback(Send/Recv Message)                   */
+  /*--------------------------------------------------*/
 
   using SendCallback =
-      std::function<void(::google::protobuf::Message *, void *)>;
+      std::function<void(::google::protobuf::Message *msg, void *user_ctx)>;
   SendCallback send_message_cb_;
 };
 
