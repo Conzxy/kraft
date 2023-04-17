@@ -6,6 +6,7 @@ gen_proto_code(PROTOC_PATH ${kraft-protoc} FILES "${CMAKE_CURRENT_SOURCE_DIR}/kr
 file(GLOB_RECURSE
   KRAFT_SOURCES
   *.cc
+  util/*.cc
 )
 
 kraft_gen_lib(kraft
@@ -17,8 +18,8 @@ target_include_directories(
   kraft
   PRIVATE ${PB_OUTPUT_DIR}
   PUBLIC 
-  "$<BUILD_INTERFACE:${CMAKE_PROJECT_SOURCE_DIR}>"
-  "$<INSTALL_INTERFACE: ${CMAKE_INSTALL_INCLUDEDIR}>"
+  "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}>"
+  "$<INSTALL_INTERFACE: ${CMAKE_INSTALL_INCLUDEDIR}>" # FIXME project-specific install dir
 )
 
 # Install files...
