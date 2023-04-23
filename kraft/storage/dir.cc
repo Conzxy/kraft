@@ -4,7 +4,7 @@
 #include <cstdlib>
 #include <cstring>
 
-#include "util/log.h"
+#include "kraft/util/log.h"
 
 using namespace kraft;
 
@@ -79,4 +79,9 @@ bool Dir::ApplyDirEntries(ApplyDirEntryCallback apply_cb)
     return false;
   }
   return true;
+}
+
+auto kraft::MakeDir(char const *dir, int mode) -> bool
+{
+  return 0 == mkdir(dir, mode);
 }

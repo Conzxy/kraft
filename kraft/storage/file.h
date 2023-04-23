@@ -5,6 +5,7 @@
 #include <stdexcept>
 #include <stdio.h>
 #include <string>
+#include <cassert>
 
 #include "kraft/macro.h"
 
@@ -34,12 +35,12 @@ class File {
     E_ERROR,
   };
 
-  enum OpenMode : uint8_t {
-    READ = 0x1,
-    WRITE = 0x2,
-    TRUNC = 0x4,
-    APP = 0x8,
-    BIN = 0x16,
+  enum OpenMode {
+    READ = (1),
+    WRITE = (1 << 1),
+    TRUNC = (1 << 2),
+    APP = (1 << 3),
+    BIN = (1 << 4),
   };
 
   File()
@@ -127,6 +128,8 @@ class File {
   FILE *fp() const noexcept { return fp_; }
   FILE *GetFileHandler() const noexcept { return fp_; }
 
+  int GetNativeHandler() const noexcept { return fileno(fp_); }
+
   size_t GetFileSize() const noexcept;
   static size_t GetFileSize(char const *path) noexcept;
 
@@ -152,7 +155,7 @@ class FileWithMeta : public File {
   FileWithMeta &operator=(FileWithMeta &&other) noexcept
   {
     if (&other != this) {
-      *this = std::move(other);
+      (File &)*this = std::move(other);
       std::swap(other.filename_, filename_);
     }
     return *this;
@@ -160,6 +163,7 @@ class FileWithMeta : public File {
 
   bool Open(char const *path, int mode) override
   {
+    assert(path);
     filename_ = path;
     return File::Open(path, mode);
   }

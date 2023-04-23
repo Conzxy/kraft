@@ -1,8 +1,8 @@
 #include "file.h"
 
 #if defined(__linux__) || defined(__unix__)
-#include <sys/stat.h>
-#include <unistd.h>
+#  include <sys/stat.h>
+#  include <unistd.h>
 #endif
 
 #include <assert.h>
@@ -66,6 +66,7 @@ bool File::Open(char const *filename, int mode)
   if (mode & BIN) {
     mod += 'b';
   }
+
   fp_ = ::fopen(filename, mod.c_str());
   return fp_ != NULL;
 }
