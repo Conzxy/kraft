@@ -11,6 +11,8 @@ include(cmake/utils.cmake)
 
 set(CMAKE_CXX_STANDARD 14)
 
+set(3_PARTY_DIR "${PROJECT_SOURCE_DIR}/third-party")
+
 include(third-party/protobuf/kraft_protobuf.cmake)
 add_subdirectory(kraft)
 add_subdirectory(test)

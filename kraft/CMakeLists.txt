@@ -5,8 +5,14 @@ gen_proto_code(PROTOC_PATH ${kraft-protoc} FILES "${CMAKE_CURRENT_SOURCE_DIR}/kr
 
 file(GLOB_RECURSE
   KRAFT_SOURCES
-  *.cc
+  error_code.cc
   util/*.cc
+  storage/raft_log_buffer.cc
+  storage/file.cc
+  storage/dir.cc
+  storage/raft_log_buffer_pool.cc
+  storage/buffer_pool_log.cc
+  ${3_PARTY_DIR}/kerror/kerror.cc 
 )
 
 kraft_gen_lib(kraft
@@ -16,10 +22,14 @@ kraft_gen_lib(kraft
 
 target_include_directories(
   kraft
-  PRIVATE ${PB_OUTPUT_DIR}
+  PUBLIC
+  ${PB_OUTPUT_DIR}
   PUBLIC 
   "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}>"
   "$<INSTALL_INTERFACE: ${CMAKE_INSTALL_INCLUDEDIR}>" # FIXME project-specific install dir
+  PUBLIC
+  "$<BUILD_INTERFACE:${3_PARTY_DIR}>"
+  "$<INSTALL_INTERFACE: ${CMAKE_INSTALL_INCLUDEDIR}/third-party>"
 )
 
 # Install files...
