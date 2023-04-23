@@ -20,15 +20,6 @@ namespace kraft {
 using Request = Message;
 using Response = Message;
 
-// Don't use macro to represent const variable
-// unnamed enum is a good replacement.
-enum : u64 {
-  INVALID_TERM = (u64)-1,
-  INVALID_INDEX = (u64)-1,
-  INVALID_VOTED_FOR = (u64)-1,
-  INVALID_ID = (u64)-1,
-};
-
 // NOTE: HB: Heart Beat
 enum NodeFlag : u8 {
   NODE_NONE = 0,   // INVALID state
@@ -73,26 +64,6 @@ class Raft {
     CANDIDATE,
     LEADER,
   };
-
-  enum ErrorCode {
-    E_OK = 0,
-    E_NODE_NONEXISTS,
-    E_INVALID_REQUEST,
-    E_INVALID_RESPONSE,
-    E_INCORRECT_STATE,
-    E_NOT_ONLY_LEADER,
-    E_INCORRECT_TO_NODE,
-    E_INCORRECT_FROM_NODE,
-    E_TRUNCATE,
-    E_UNKNONN,
-    E_LOG_APPEND_ENTRY,
-    E_LOG_GET_ENTRY,
-    E_LOG_APPLY,
-    E_ADD_PEER_NODE,
-    E_ERR_NUM_,
-  };
-
-  static constexpr char const *ErrorCode2Str(ErrorCode e) noexcept;
 
   explicit Raft(size_t peer_node_num = 0);
   ~Raft() noexcept;
@@ -231,7 +202,7 @@ class Raft {
   // YOU don't care the performance problem.
 
   // Storage layer
-  std::function<bool(Entry const &entry)> log_append_entry_cb_;
+  std::function<bool(Entry &entry)> log_append_entry_cb_;
   std::function<bool(PersistentState const &state)> log_set_state_;
   std::function<EntryMeta()> log_get_last_entry_meta_cb_;
   std::function<u64(u64 index)> log_get_entry_meta_cb_;

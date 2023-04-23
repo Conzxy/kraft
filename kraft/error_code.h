@@ -1,0 +1,52 @@
+#ifndef _KRAFT_ERROR_CODE_H__
+
+#define _KRAFT_ERROR_CODE_H__
+
+#include "kraft/macro.h"
+
+namespace kraft {
+
+enum ErrorCode {
+  // Raft
+  E_OK = 0, // reserved, may unused
+  E_NODE_NONEXISTS,
+  E_INVALID_REQUEST,
+  E_INVALID_RESPONSE,
+  E_INCORRECT_STATE,
+  E_NOT_ONLY_LEADER,
+  E_INCORRECT_TO_NODE,
+  E_INCORRECT_FROM_NODE,
+  E_TRUNCATE,
+  E_UNKNONN,
+  E_LOG_APPEND_ENTRY,
+  E_LOG_GET_ENTRY,
+  E_LOG_APPLY,
+  E_ADD_PEER_NODE,
+
+  // RaftLogBufferPool
+  E_OPEN_DIR,
+  E_READ_DIR,
+  E_INVALID_LOG_FILENAME,
+  E_OPEN_LOGGING_FILE,
+  E_OPEN_META_FILE,
+
+  // RaftLogBuffer
+  E_OPEN_LOG_FILE,
+  E_READ_FILE,
+  E_SIZE_HEADER_INCOMPLTE,
+  E_ENTRY_INCOMPELTE,
+  E_SERIALIZE_ENTRY,
+  E_RENAME_FULL_LOG_FILE,
+  E_REMOVE_TRUNCATED_LOG_FILE,
+  E_INVALID_LOG_CONTENT,
+  E_INVALID_LOG_ENTRY,
+  E_WRITE_FILE,
+
+  E_ALLOC,
+};
+
+extern KRAFT_TLS int errcode;
+
+} // namespace kraft
+
+#endif
