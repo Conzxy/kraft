@@ -1,4 +1,4 @@
-#include "kraft/string_util.h"
+#include "kraft/util/string_util.h"
 
 #include "kraft/macro.h"
 #include <cassert>
@@ -21,4 +21,13 @@ bool kraft::Raw2U64(void const *raw, size_t n, u64 *num) noexcept
     return false;
   }
   return true;
+}
+
+std::string kraft::GetFilenameWithoutDir(std::string const &path)
+{
+  auto flash_pos = path.rfind('/');
+  if (path.npos != flash_pos) {
+    return path.substr(flash_pos + 1);
+  }
+  return path;
 }
