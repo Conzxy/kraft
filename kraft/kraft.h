@@ -11,7 +11,11 @@
 #include "kraft/macro.h"
 #include "kraft/type.h"
 
+#include <kerror/kerror.h>
+
 namespace kraft {
+
+using kerror::Error;
 
 // Dummy type to distinguish the request
 // and response of raft message
@@ -79,8 +83,17 @@ class Raft {
   bool AddPeerNode(u64 id, void *user_ctx);
   bool AddSelfNode(u64 id, void *user_ctx = nullptr);
 
-  ErrorCode AskNodeId(void *user_ctx);
-  ErrorCode RecvAskNodeResponse(Response &response, void *user_ctx);
+  /**
+   * \brief
+   *
+   * \param user_ctx
+   *
+   * \return
+   *
+   * \errno
+   */
+  Error AskNodeId(void *user_ctx);
+  Error RecvAskNodeResponse(Response &response, void *user_ctx);
 
   /*--------------------------------------------------*/
   /* Periodic operation                               */
@@ -94,15 +107,15 @@ class Raft {
   /* State machine                                    */
   /*--------------------------------------------------*/
 
-  ErrorCode AppendLog(void const *data, size_t n);
-  ErrorCode AppendConfChangeLog(u64 id, void const *conf_ctx, size_t n);
+  Error AppendLog(void const *data, size_t n);
+  Error AppendConfChangeLog(u64 id, void const *conf_ctx, size_t n);
 
-  ErrorCode RecvVoteResponse(Response &rsp);
-  ErrorCode RecvVoteRequest(Request &req);
-  ErrorCode RecvHeartBeatResponse(Response &req);
-  ErrorCode RecvHeartBeatRequest(Response &rep);
-  ErrorCode RecvAppendEntriesResponse(Response &rep);
-  ErrorCode RecvAppendEntriesRequest(Request &req);
+  Error RecvVoteResponse(Response &rsp);
+  Error RecvVoteRequest(Request &req);
+  Error RecvHeartBeatResponse(Response &req);
+  Error RecvHeartBeatRequest(Response &rep);
+  Error RecvAppendEntriesResponse(Response &rep);
+  Error RecvAppendEntriesRequest(Request &req);
 
   KRAFT_INLINE bool IsLeader() const noexcept
   {

@@ -5,13 +5,17 @@
   decltype(peer_node_map_)::iterator node_iter;                                \
   do {                                                                         \
     if ((msg_).to() != self_node_.id) {                                        \
-      return E_INCORRECT_TO_NODE;                                              \
+      errcode = E_INCORRECT_TO_NODE;                                           \
+      return MakeNoInfoError();                                                \
     }                                                                          \
                                                                                \
     node_iter = peer_node_map_.find((msg_).from());                            \
     if (node_iter == peer_node_map_.end()) {                                   \
-      return E_INCORRECT_FROM_NODE;                                            \
+      errcode = E_INCORRECT_FROM_NODE;                                         \
+      \ return MakeNoInfoError();                                              \
+      \                                                                        \
     }                                                                          \
+    \                                                                          \
   } while (0)
 
 Raft::Raft(size_t peer_node_num)
@@ -122,7 +126,7 @@ void Raft::BecomeCandidate()
 
 void Raft::BecomeLeader()
 {
-  KRAFT_ASSERT(!IsFollower() && !Isleader(),
+  KRAFT_ASSERT(!IsFollower() && !IsLeader(),
                "Can't convert follwer/leader to leader");
   state_ = RaftState::LEADER;
   RaftImpl::Log(this, "Voted num = %llu", voted_num_);
@@ -158,11 +162,11 @@ void Raft::BecomeFollower()
 }
 
 // Follower
-auto Raft::RecvVoteRequest(Request &request) -> ErrorCode
+auto Raft::RecvVoteRequest(Request &request) -> Error
 {
   // Ignore leader
   if (IsLeader()) {
-    return E_OK;
+    return MakeSuccess();
   }
 
   CHECK_MESSAGE_(request);
@@ -179,7 +183,7 @@ auto Raft::RecvVoteRequest(Request &request) -> ErrorCode
   // CheckRequestTerm has handle this request
   // return OK is ok.
   if (RaftImpl::CheckRequestTerm(this, request, &response, ctx)) {
-    return E_OK;
+    return MakeSuccess();
   }
 
   // If self node don't vote any node or
@@ -192,35 +196,37 @@ auto Raft::RecvVoteRequest(Request &request) -> ErrorCode
     response.set_success(true);
   } else {
     KRAFT_ASSERT(voted_for() != INVALID_VOTED_FOR &&
-                     peer_node_map_.find(voted_for) != peer_node_map_.end(),
+                     peer_node_map_.find(voted_for()) != peer_node_map_.end(),
                  "Voted for is an invalid node id");
     response.set_success(false);
   }
 
   send_message_cb_(&response, ctx);
-  return E_OK;
+  return MakeSuccess();
 }
 
-auto Raft::RecvVoteResponse(Response &response) -> ErrorCode
+auto Raft::RecvVoteResponse(Response &response) -> Error
 {
   // The node has become leader
   // ignore the vote response.
   if (IsLeader()) {
-    return E_OK;
+    return MakeSuccess();
   }
 
   // Start a new election
   if (!IsCandidate()) {
     KRAFT_ASSERT1(voted_for() == INVALID_VOTED_FOR);
     KRAFT_ASSERT1(voted_num_ == 0);
-    return E_INCORRECT_STATE;
+    // errcode = E_INCORRECT_STATE;
+    return MakeSuccess();
   }
   KRAFT_ASSERT(response.has_success(),
                "response must has the 'success' fields");
 
   auto node_iter = peer_node_map_.find(response.from());
   if (node_iter == peer_node_map_.end()) {
-    return E_NODE_NONEXISTS;
+    errcode = E_NODE_NONEXISTS;
+    return MakeNoInfoError();
   }
 
   if (response.success()) {
@@ -228,33 +234,36 @@ auto Raft::RecvVoteResponse(Response &response) -> ErrorCode
     if (IsMajorityVoted()) {
       BecomeLeader();
     }
-    return E_OK;
+    return MakeSuccess();
   }
 
   KRAFT_ASSERT1(!response.success());
 
   RaftImpl::SetTerm(this, KRAFT_MAX(term(), response.term()));
-  return E_OK;
+  return MakeSuccess();
 }
 
-auto Raft::RecvHeartBeatResponse(Response &response) -> ErrorCode
+auto Raft::RecvHeartBeatResponse(Response &response) -> Error
 {
-  if (!IsLeader()) return E_INCORRECT_STATE;
+  if (!IsLeader()) {
+    errcode = E_INCORRECT_STATE;
+    return MakeSuccess();
+  }
 
   CHECK_MESSAGE_(response);
 
   auto &node = peer_nodes_[node_iter->second];
 
   if (RaftImpl::CheckResponseTerm(this, response)) {
-    return E_OK;
+    return MakeSuccess();
   }
 
   leader_id_ = response.from();
   node.flag |= NODE_RECV_HARTBEAT;
-  return E_OK;
+  return MakeSuccess();
 }
 
-auto Raft::RecvHeartBeatRequest(Request &request) -> ErrorCode
+auto Raft::RecvHeartBeatRequest(Request &request) -> Error
 {
   KRAFT_ASSERT(!IsLeader(), "Leader receive AppendEntries Request");
   if (IsCandidate()) {
@@ -270,7 +279,7 @@ auto Raft::RecvHeartBeatRequest(Request &request) -> ErrorCode
   auto &node = peer_nodes_[node_iter->second];
 
   if (RaftImpl::CheckRequestTerm(this, request, &response, node.ctx)) {
-    return E_OK;
+    return MakeSuccess();
   }
 
   response.set_success(true);
@@ -278,19 +287,22 @@ auto Raft::RecvHeartBeatRequest(Request &request) -> ErrorCode
   response.set_to(request.to());
   response.set_term(term());
   send_message_cb_(&response, node.ctx);
-  return E_OK;
+  return MakeSuccess();
 }
 
-auto Raft::RecvAppendEntriesResponse(Response &response) -> ErrorCode
+auto Raft::RecvAppendEntriesResponse(Response &response) -> Error
 {
-  if (!IsLeader()) return E_INCORRECT_STATE;
+  if (!IsLeader()) {
+    errcode = E_INCORRECT_STATE;
+    return MakeSuccess();
+  }
 
   CHECK_MESSAGE_(response);
 
   // auto &node = peer_nodes_[node_iter->second];
 
   if (RaftImpl::CheckResponseTerm(this, response)) {
-    return E_OK;
+    return MakeSuccess();
   }
 
   auto peer_id = response.from();
@@ -316,10 +328,10 @@ auto Raft::RecvAppendEntriesResponse(Response &response) -> ErrorCode
   }
 
   leader_id_ = response.from();
-  return E_OK;
+  return MakeSuccess();
 }
 
-auto Raft::RecvAppendEntriesRequest(Request &request) -> ErrorCode
+auto Raft::RecvAppendEntriesRequest(Request &request) -> Error
 {
   KRAFT_ASSERT(!IsLeader(), "Leader receive AppendEntries Request");
   if (IsCandidate()) {
@@ -336,7 +348,7 @@ auto Raft::RecvAppendEntriesRequest(Request &request) -> ErrorCode
 
   Response response;
   if (RaftImpl::CheckRequestTerm(this, request, &response, node.ctx)) {
-    return E_OK;
+    return MakeSuccess();
   }
 
   response.set_from(self_node_.id);
@@ -356,16 +368,17 @@ auto Raft::RecvAppendEntriesRequest(Request &request) -> ErrorCode
       check_term = log_get_entry_meta_cb_(i);
       if (check_term == INVALID_TERM) {
         // AE impl Rule 4
-        log_append_entry_cb_(request.entries()[i]);
+        log_append_entry_cb_(const_cast<Entry &>(request.entries()[i]));
         need_check_term = false;
       } else if (check_term != request.entries()[i].term()) {
         // AE impl Rule 3
         if (!log_truncate_after_cb_(i)) {
-          return E_TRUNCATE;
+          errcode = E_TRUNCATE;
+          return MakeMsgErrorf("Failed to truncate the log in %llu\n", (ull)i);
         }
       }
     } else {
-      log_append_entry_cb_(request.entries()[i]);
+      log_append_entry_cb_(const_cast<Entry &>(request.entries()[i]));
     }
 
     // AE Impl Rule 5
@@ -377,73 +390,47 @@ auto Raft::RecvAppendEntriesRequest(Request &request) -> ErrorCode
   }
 
   send_message_cb_(&response, node.ctx);
-  return E_OK;
+  return MakeSuccess();
 }
 
-auto Raft::AppendLog(void const *data, size_t n) -> ErrorCode
+auto Raft::AppendLog(void const *data, size_t n) -> Error
 {
   return RaftImpl::AppendLogEntry(this, ENTRY_NORMAL, data, n);
 }
 
-auto Raft::AppendConfChangeLog(u64 id, void const *conf_ctx, size_t n)
-    -> ErrorCode
+auto Raft::AppendConfChangeLog(u64 id, void const *conf_ctx, size_t n) -> Error
 {
   return RaftImpl::AppendConfLogEntry(this, CONF_CHANGE_ADD_NODE, id, conf_ctx,
                                       n);
 }
 
-auto Raft::AskNodeId(void *user_ctx) -> ErrorCode
+auto Raft::AskNodeId(void *user_ctx) -> Error
 {
   Request request = RaftImpl::MakeRequest(this, MSG_ASK_ID);
   // request.set_commit(commit_);
   send_message_cb_(&request, user_ctx);
 
-  return E_OK;
+  return MakeSuccess();
 }
 
-auto Raft::RecvAskNodeResponse(Response &response, void *user_ctx) -> ErrorCode
+auto Raft::RecvAskNodeResponse(Response &response, void *user_ctx) -> Error
 {
   if (response.to() != self_node_.id) {
-    return E_INVALID_RESPONSE;
+    errcode = E_INVALID_RESPONSE;
+    return MakeNoInfoError();
   }
 
   auto node_iter = peer_node_map_.find(response.from());
   if (node_iter != peer_node_map_.end()) {
     // Has added, ignore this response
     // Maybe a duplicate message since network problem.
-    return E_OK;
+    return MakeSuccess();
   }
 
   peer_nodes_.emplace_back(response.from(), user_ctx);
   if (!peer_node_map_.emplace(response.from(), peer_nodes_.size() - 1).second) {
-    return E_ADD_PEER_NODE;
+    errcode = E_ADD_PEER_NODE;
+    return MakeNoInfoError();
   }
-  return E_OK;
-}
-
-static constexpr char const *s_kraft_error_code_strings[] = {
-    "OK",
-    "Node does not exists",
-    "Invalid request",
-    "Invalid response",
-    "Incorrect Role state",
-    "Not only leader",
-    "Incorrect to node",
-    "Incorrect from node",
-    "Failed to Truncate",
-    "Unkonwn error",
-    "Failed to append log entry",
-    "Failed to get log entry",
-    "Failed to apply log entry",
-    "Failed to add peer node(exists?)",
-};
-
-static_assert(sizeof(s_kraft_error_code_strings) /
-                      sizeof(s_kraft_error_code_strings[0]) ==
-                  Raft::ErrorCode::E_ERR_NUM_,
-              "ErrorCode strings is not complete");
-
-constexpr char const *Raft::ErrorCode2Str(ErrorCode e) noexcept
-{
-  return s_kraft_error_code_strings[(int)e];
+  return MakeSuccess();
 }
