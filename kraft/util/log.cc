@@ -1,3 +1,4 @@
+// SPDX-LICENSE-IDENTIFIER: BSD-2-Clause
 #include "log.h"
 
 #include <cstdarg>

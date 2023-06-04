@@ -1,3 +1,4 @@
+// SPDX-LICENSE-IDENTIFIER: BSD-2-Clause
 #include "file.h"
 
 #if defined(__linux__) || defined(__unix__)

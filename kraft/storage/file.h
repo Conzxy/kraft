@@ -1,3 +1,4 @@
+// SPDX-LICENSE-IDENTIFIER: BSD-2-Clause
 #ifndef KRAFT_FILE_H__
 #define KRAFT_FILE_H__
 

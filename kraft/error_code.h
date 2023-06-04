@@ -1,3 +1,4 @@
+// SPDX-LICENSE-IDENTIFIER: BSD-2-Clause
 #ifndef _KRAFT_ERROR_CODE_H__
 
 #define _KRAFT_ERROR_CODE_H__

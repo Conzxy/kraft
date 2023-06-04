@@ -1,3 +1,4 @@
+// SPDX-LICENSE-IDENTIFIER: BSD-2-Clause
 syntax = "proto2";
 
 package kraft;
@@ -26,6 +27,11 @@ enum MessageType {
   MSG_ASK_ID_RES = 7;
   MSG_HEART_BEAT_RES = 8;
   MSG_NO_OP_RES = 9;
+  /* Send the message with entries to leader,
+   * then, leader append it to local and send to peers.
+   */
+  MSG_PROPOSE = 10;
+  MSG_PROPOSE_RES = 11;
 }
 
 /*

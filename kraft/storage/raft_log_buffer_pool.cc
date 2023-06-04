@@ -1,3 +1,4 @@
+// SPDX-LICENSE-IDENTIFIER: BSD-2-Clause
 #include "kraft/storage/raft_log_buffer_pool_impl.h"
 
 #include "kraft/error_code.h"

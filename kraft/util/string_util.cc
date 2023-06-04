@@ -1,3 +1,4 @@
+// SPDX-LICENSE-IDENTIFIER: BSD-2-Clause
 #include "kraft/util/string_util.h"
 
 #include "kraft/macro.h"

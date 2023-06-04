@@ -1,3 +1,4 @@
+// SPDX-LICENSE-IDENTIFIER: BSD-2-Clause
 #include "buffer_pool_log.h"
 
 using namespace kraft;
