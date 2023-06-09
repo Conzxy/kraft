@@ -17,3 +17,5 @@ option(KRAFT_TESTS "Generate kraft test targets" OFF)
 # e.g. cmake --build */KRAFT/build [--target all -j 2]
 # If this option is OFF, user should specify target manually.
 option(KRAFT_BUILD_ALL_TESTS "Build tests when --target all(default) is specified" OFF)
+
+option(KRAFT_LINK_PROTOBUF "Link to protobuf lib provided by third-party/protobuf" ON)
