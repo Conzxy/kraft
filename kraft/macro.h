@@ -23,6 +23,10 @@
   class_ &operator=(class_ const &) = delete;                                  \
   class_(class_ const &) = delete
 
+#define KRAFT_DISABLE_MOVE(class_)                                             \
+  class_ &operator=(class_ &&) = delete;                                       \
+  class_(class_ &&) = delete
+
 #define KRAFT_FILE_NAME_LEN 256
 #define KRAFT_UNUSED(x_)    (void)(x_)
 

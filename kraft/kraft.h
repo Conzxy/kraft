@@ -6,7 +6,6 @@
 #include <functional>
 #include <vector>
 
-// #include ""
 #include "kraft.pb.h"
 #include "kraft/macro.h"
 #include "kraft/type.h"
@@ -63,7 +62,7 @@ struct Node {
 class Raft {
  public:
   // FIXME init state?
-  enum class RaftState {
+  enum class RaftState : u8 {
     FOLLOWER = 0,
     CANDIDATE,
     LEADER,
@@ -73,7 +72,7 @@ class Raft {
   ~Raft() noexcept;
 
   // FIXME move operation
-
+  KRAFT_DISABLE_MOVE(Raft);
   KRAFT_DISABLE_COPY(Raft);
 
   /*--------------------------------------------------*/
@@ -171,9 +170,42 @@ class Raft {
   }
 
  private:
-  friend struct RaftImpl;
-  struct RaftImpl;
+  /*--------------------------------------------------*/
+  /* Impl helpers(defined in kraft.cc)                */
+  /*--------------------------------------------------*/
 
+  void Log(char const *fmt, ...) const;
+
+  static ConfChange MakeConfChange(ConfChangeType conf_type, u64 id,
+                                   void const *conf_ctx, size_t conf_ctx_len);
+
+  void InitNextIndices() noexcept;
+  void InitMatchIndices() noexcept;
+
+  bool CheckResponseTerm(Response const &response);
+  bool CheckRequestTerm(Request &request, Response *response, void *ctx);
+  bool IsLogUptodate(u64 term, u64 index) const noexcept;
+
+  Request MakeRequest(MessageType type) const;
+  Response MakeResponse(Request const &request) const;
+  void SendVoteRequestAll() const;
+
+  Entry MakeEntry(EntryType type, void const *data, u64 n);
+  Error AppendLogEntry(EntryType type, void const *data, u64 n);
+  Error FillAppendEntriesRequest(Request *request, u64 start_idx,
+                                 u64 last_entry_index) const;
+  Error AppendConfLogEntry(ConfChangeType type, u64 id, void const *conf_ctx,
+                           u64 conf_ctx_len);
+  Error AppendNoOpLogEntry();
+  Error ApplyEntries();
+  Error IncrementCommitIndex();
+
+  bool LogState() const;
+  void SetId(u64 id);
+  void SetVotedFor(u64 id);
+  void SetTerm(u64 term);
+
+ private:
   std::vector<Node> peer_nodes_;
   HashMap<u64, u64> peer_node_map_; // NodeId -> NodeIndex
   Node self_node_;
@@ -195,6 +227,10 @@ class Raft {
   std::vector<u64> next_indices_;
   std::vector<u64> match_indices_;
 
+  // no replicated log entries member.
+  // The raft instance will call the callback to append log entry to storage layer.
+  // The implementation of storage layer is managed by user, 
+  // and the raft instance will call the callback to append log entry to storage layer.
  public:
   /*--------------------------------------------------*/
   /* Log Callback(for debug)                          */
@@ -222,7 +258,7 @@ class Raft {
   std::function<bool(u64 index)> log_truncate_after_cb_;
 
   // User must ensure this point is valid when call this function
-  // even though in mutlthread environment
+  // even though in multithread environment
   // \param entry is pointer to a const entry
   std::function<bool(u64 index, Entry const **entry)> log_get_entry_cb_;
 

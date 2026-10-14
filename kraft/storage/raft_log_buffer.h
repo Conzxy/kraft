@@ -30,7 +30,7 @@ DEFINE_BOOLEAN_ENUM_CLASS(ReadOnlyFlag);
 class RaftLogBuffer {
   friend class BufferPoolLog;
 
-  using Entrys = std::vector<Entry>;
+  using Entries = std::vector<Entry>;
 
  public:
   RaftLogBuffer() noexcept;
@@ -163,12 +163,12 @@ class RaftLogBuffer {
     return entries_.back();
   }
 
-  KRAFT_INLINE Entrys::const_iterator begin() const noexcept
+  KRAFT_INLINE Entries::const_iterator begin() const noexcept
   {
     return entries_.cbegin();
   }
 
-  KRAFT_INLINE Entrys::const_iterator end() const noexcept
+  KRAFT_INLINE Entries::const_iterator end() const noexcept
   {
     return entries_.cend();
   }
