@@ -38,9 +38,10 @@ void Raft::Log(char const *fmt, ...) const
   va_list args;
   va_start(args, fmt);
   const auto writen = vsprintf(buf, fmt, args);
-  if (writen < 0) return;
-
+  if (writen > 0) {
   log_cb_(buf, writen);
+  }
+
   va_end(args);
 }
 
@@ -249,7 +250,7 @@ auto Raft::AppendConfLogEntry(ConfChangeType type, u64 id, void const *conf_ctx,
                               u64 conf_ctx_len) -> Error
 {
   auto conf_chg =
-      MakeConfChange(CONF_CHANGE_ADD_NODE, id, conf_ctx, conf_ctx_len);
+      MakeConfChange(type, id, conf_ctx, conf_ctx_len);
   auto conf_chg_data = conf_chg.SerializeAsString();
   return AppendLogEntry(ENTRY_CONF, conf_chg_data.data(), conf_chg_data.size());
 }
@@ -260,7 +261,7 @@ auto Raft::ApplyEntries() -> Error
                "The last applied index must be <= commit index");
 
   Entry const *apply_entry = nullptr;
-  for (u64 i = last_applied_ + 1; i < commit_; ++i) {
+  for (u64 i = last_applied_ + 1; i <= commit_; ++i) {
     if (!log_get_entry_cb_(i, &apply_entry)) {
       errcode = E_LOG_GET_ENTRY;
       return MakeMsgErrorf("Failed to get log entry in %llu when apply entries",
@@ -619,18 +620,18 @@ auto Raft::RecvHeartBeatRequest(Request &request) -> Error
     BecomeFollower();
   }
 
-  Response response;
-  CHECK_MESSAGE_(response);
+  CHECK_MESSAGE_(request);
 
   auto &node = peer_nodes_[node_iter->second];
 
+  Response response;
   if (CheckRequestTerm(request, &response, node.ctx)) {
     return MakeSuccess();
   }
 
   response.set_success(true);
   response.set_from(self_node_.id);
-  response.set_to(request.to());
+  response.set_to(request.from());
   response.set_term(term());
   send_message_cb_(&response, node.ctx);
   return MakeSuccess();
