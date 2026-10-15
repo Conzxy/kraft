@@ -39,7 +39,7 @@ void Raft::Log(char const *fmt, ...) const
   va_start(args, fmt);
   const auto writen = vsprintf(buf, fmt, args);
   if (writen > 0) {
-  log_cb_(buf, writen);
+    log_cb_(buf, writen);
   }
 
   va_end(args);
@@ -210,7 +210,7 @@ auto Raft::AppendLogEntry(EntryType type, void const *data, u64 n) -> Error
     request.set_log_term(prev_entry_term);
 
     if (start_idx <= last_entry_index)
-    request.mutable_entries()->Reserve(last_entry_index - start_idx + 1);
+      request.mutable_entries()->Reserve(last_entry_index - start_idx + 1);
     for (; start_idx <= last_entry_index; ++start_idx) {
       // The storage layer hands back a pointer to its own entry,
       // so the entry must be copied into the request
@@ -238,7 +238,7 @@ auto Raft::FillAppendEntriesRequest(Request *request, u64 start_idx,
   auto prev_entry_term = log_get_entry_meta_cb_(start_idx - 1);
   request->set_log_term(prev_entry_term);
   if (start_idx <= last_entry_index)
-  request->mutable_entries()->Reserve(last_entry_index - start_idx + 1);
+    request->mutable_entries()->Reserve(last_entry_index - start_idx + 1);
   for (; start_idx <= last_entry_index; ++start_idx) {
     // The storage layer hands back a pointer to its own entry,
     // so the entry must be copied into the request
