@@ -209,15 +209,18 @@ auto Raft::AppendLogEntry(EntryType type, void const *data, u64 n) -> Error
     const auto prev_entry_term = log_get_entry_meta_cb_(start_idx - 1);
     request.set_log_term(prev_entry_term);
 
+    if (start_idx <= last_entry_index)
     request.mutable_entries()->Reserve(last_entry_index - start_idx + 1);
     for (; start_idx <= last_entry_index; ++start_idx) {
-      request.mutable_entries()->Add();
-      Entry const *p_entry = *(--request.mutable_entries()->pointer_end());
-      // auto request.mutable_entries()->Add();
+      // The storage layer hands back a pointer to its own entry,
+      // so the entry must be copied into the request
+      Entry const *p_entry = nullptr;
       if (!log_get_entry_cb_(start_idx, &p_entry)) {
         errcode = E_LOG_GET_ENTRY;
         return MakeMsgErrorf("Failed to get log entry in %llu", start_idx);
       }
+      KRAFT_ASSERT(p_entry, "The entry must be non-null on success");
+      *request.mutable_entries()->Add() = *p_entry;
     }
     send_message_cb_(&request, node.ctx);
   }
@@ -234,14 +237,18 @@ auto Raft::FillAppendEntriesRequest(Request *request, u64 start_idx,
   // FIXME cache term?
   auto prev_entry_term = log_get_entry_meta_cb_(start_idx - 1);
   request->set_log_term(prev_entry_term);
+  if (start_idx <= last_entry_index)
   request->mutable_entries()->Reserve(last_entry_index - start_idx + 1);
   for (; start_idx <= last_entry_index; ++start_idx) {
-    request->mutable_entries()->Add();
-    Entry const *p_entry = *(--request->mutable_entries()->pointer_end());
+    // The storage layer hands back a pointer to its own entry,
+    // so the entry must be copied into the request
+    Entry const *p_entry = nullptr;
     if (!log_get_entry_cb_(start_idx, &p_entry)) {
       errcode = E_LOG_GET_ENTRY;
       return MakeMsgErrorf("Failed to get log entry in %llu", start_idx);
     }
+    KRAFT_ASSERT(p_entry, "The entry must be non-null on success");
+    *request->mutable_entries()->Add() = *p_entry;
   }
   return MakeSuccess();
 }
