@@ -659,24 +659,25 @@ auto Raft::RecvAppendEntriesResponse(Response &response) -> Error
     return MakeSuccess();
   }
 
-  auto peer_id = response.from();
+  const auto peer_id = response.from();
+  const auto node_idx = node_iter->second;
   if (response.success()) {
     // Peer has log these entries logs to its log
     auto entries_num = response.hint();
-    next_indices_[peer_id] = entries_num;
-    match_indices_[peer_id] = entries_num - 1;
+    next_indices_[node_idx] = entries_num;
+    match_indices_[node_idx] = entries_num - 1;
   } else {
     auto conflict_num = response.hint();
-    match_indices_[peer_id] = next_indices_[peer_id] - conflict_num;
-    next_indices_[peer_id] -= conflict_num;
+    match_indices_[node_idx] = next_indices_[node_idx] - conflict_num;
+    next_indices_[node_idx] -= conflict_num;
 
     auto request = MakeRequest(MSG_AE);
     request.set_to(peer_id);
     request.set_commit(commit_);
     auto last_entry_meta = log_get_last_entry_meta_cb_();
-    FillAppendEntriesRequest(&request, next_indices_[peer_id],
+    FillAppendEntriesRequest(&request, next_indices_[node_idx],
                              last_entry_meta.index);
-    Log("Retry send AE request [%llu, %llu]", next_indices_[peer_id],
+    Log("Retry send AE request [%llu, %llu]", next_indices_[node_idx],
         last_entry_meta);
     send_message_cb_(&request, peer_nodes_[node_iter->second].ctx);
   }
