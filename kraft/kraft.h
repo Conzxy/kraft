@@ -23,12 +23,22 @@ using kerror::Error;
 using Request = Message;
 using Response = Message;
 
+// A monotonic clock, in milliseconds.
+//
+// The library never reads the wall clock by itself: the host injects the
+// clock so a Raft instance can share the host's time source, and so tests
+// can drive the state machine deterministically.
+using Clock = std::function<u64()>;
+
+// The clock used when the host injects nothing.
+u64 SteadyClockMs() noexcept;
+
 // NOTE: HB: Heart Beat
 enum NodeFlag : u8 {
   NODE_NONE = 0,   // INVALID state
   NODE_ACTIVE = 1, // HB Request is OK
   NODE_VOTING = (1 << 1),
-  NODE_RECV_HARTBEAT = (1 << 2),
+  NODE_RECV_HEARTBEAT = (1 << 2),
 };
 
 struct Node {
@@ -52,7 +62,7 @@ struct Node {
 
   KRAFT_INLINE bool IsRecvHeartBeat() const noexcept
   {
-    return flag & NODE_RECV_HARTBEAT;
+    return flag & NODE_RECV_HEARTBEAT;
   }
 };
 
@@ -62,7 +72,7 @@ struct Node {
 class Raft {
  public:
   // FIXME init state?
-  enum class RaftState : u8 {
+  enum class RaftRole : u8 {
     FOLLOWER = 0,
     CANDIDATE,
     LEADER,
@@ -95,6 +105,36 @@ class Raft {
   Error RecvAskNodeResponse(Response &response, void *user_ctx);
 
   /*--------------------------------------------------*/
+  /* Host-provided environment                        */
+  /*--------------------------------------------------*/
+
+  // Install the clock the raft instance reads. Without one, SteadyClockMs()
+  // is used. The clock must be monotonic and never go backwards.
+  void SetClock(Clock clock) noexcept { clock_ = std::move(clock); }
+
+  KRAFT_INLINE u64 NowMs() const noexcept
+  {
+    return clock_ ? clock_() : SteadyClockMs();
+  }
+
+  /**
+   * \brief Whether every storage/IO callback the state machine needs is
+   * installed.
+   *
+   * An instance is constructed before its host can install the callbacks, so
+   * the periodic entry points stay no-ops until this becomes true. The host
+   * can therefore start driving the instance without having to order
+   * "install everything" before "construct" or "start".
+   */
+  KRAFT_INLINE bool IsReady() const noexcept
+  {
+    return log_append_entry_cb_ && log_set_state_ &&
+           log_get_last_entry_meta_cb_ && log_get_entry_meta_cb_ &&
+           log_truncate_after_cb_ && log_get_entry_cb_ && log_apply_entry_cb_ &&
+           send_message_cb_;
+  }
+
+  /*--------------------------------------------------*/
   /* Periodic operation                               */
   /*--------------------------------------------------*/
 
@@ -109,36 +149,36 @@ class Raft {
   Error AppendLog(void const *data, size_t n);
   Error AppendConfChangeLog(u64 id, void const *conf_ctx, size_t n);
 
-  Error RecvVoteResponse(Response &rsp);
-  Error RecvVoteRequest(Request &req);
-  Error RecvHeartBeatResponse(Response &req);
-  Error RecvHeartBeatRequest(Response &rep);
-  Error RecvAppendEntriesResponse(Response &rep);
-  Error RecvAppendEntriesRequest(Request &req);
+  Error RecvVoteResponse(Response &response);
+  Error RecvVoteRequest(Request &request);
+  Error RecvHeartBeatResponse(Response &response);
+  Error RecvHeartBeatRequest(Request &request);
+  Error RecvAppendEntriesResponse(Response &response);
+  Error RecvAppendEntriesRequest(Request &request);
 
   KRAFT_INLINE bool IsLeader() const noexcept
   {
-    return state_ == RaftState::LEADER;
+    return role_ == RaftRole::LEADER;
   }
   KRAFT_INLINE bool IsFollower() const noexcept
   {
-    return state_ == RaftState::FOLLOWER;
+    return role_ == RaftRole::FOLLOWER;
   }
   KRAFT_INLINE bool IsCandidate() const noexcept
   {
-    return state_ == RaftState::CANDIDATE;
+    return role_ == RaftRole::CANDIDATE;
   }
 
- private:
   /*--------------------------------------------------*/
   /* State getter                                     */
   /*--------------------------------------------------*/
 
-  void BecomeLeader();
-  void BecomeFollower();
-  void BecomeCandidate();
+  // These getters are the read-only view of the raft instance.
+  // The host needs them to drive the raft instance, e.g. comparing
+  // a peer's term with term() decides whether the election timer
+  // should be reset.
 
-  KRAFT_INLINE RaftState state() const noexcept { return state_; }
+  KRAFT_INLINE RaftRole role() const noexcept { return role_; }
 
   KRAFT_INLINE u64 term() const noexcept { return persistent_state_.term(); }
 
@@ -149,24 +189,103 @@ class Raft {
 
   KRAFT_INLINE u64 id() const noexcept { return persistent_state_.id(); }
 
-  KRAFT_INLINE bool IsMajorityVoted() const noexcept
-  {
-    return voted_num_ > ((peer_nodes_.size() + 1) >> 1);
-  }
+  KRAFT_INLINE u64 commit_index() const noexcept { return commit_; }
+
+  KRAFT_INLINE u64 last_applied() const noexcept { return last_applied_; }
 
   KRAFT_INLINE u64 leader_id() const noexcept { return leader_id_; }
 
-  KRAFT_INLINE void *leader_context() noexcept
+  /**
+   * \brief The last time (in ms, on the injected clock) at which this
+   * instance was contacted by the leader it currently recognizes, or
+   * granted its vote to a candidate.
+   *
+   * This is the stamp an election-timeout driver compares against its own
+   * deadline, so that a follower resets its timer exactly when the Raft
+   * rules say it must, without the driver having to re-derive those rules
+   * from the message stream.
+   *
+   * \return 0 if the instance has never been contacted.
+   */
+  KRAFT_INLINE u64 last_leader_contact_ms() const noexcept
   {
-    if (leader_id_ == INVALID_INDEX) {
+    return last_leader_contact_ms_;
+  }
+
+  /**
+   * \brief The index of the last entry of the local log.
+   *
+   * \return INVALID_INDEX if the log storage callback is not installed yet.
+   */
+  KRAFT_INLINE u64 last_log_index() const noexcept
+  {
+    if (!log_get_last_entry_meta_cb_) {
+      return INVALID_INDEX;
+    }
+    return log_get_last_entry_meta_cb_().index;
+  }
+
+  /**
+   * \brief The term of the last entry of the local log.
+   *
+   * \return INVALID_TERM if the log storage callback is not installed yet.
+   */
+  KRAFT_INLINE u64 last_log_term() const noexcept
+  {
+    if (!log_get_last_entry_meta_cb_) {
+      return INVALID_TERM;
+    }
+    return log_get_last_entry_meta_cb_().term;
+  }
+
+  /**
+   * \brief The host context of the node this instance currently recognizes
+   * as the leader, so that a follower can redirect a client to it.
+   *
+   * \return nullptr if no leader is known, or if this instance is the leader
+   * itself in a single-node cluster (the leader is not in peer_node_map_).
+   */
+  KRAFT_INLINE void *leader_context() const noexcept
+  {
+    if (leader_id_ == INVALID_ID) {
       return nullptr;
+    }
+    if (leader_id_ == self_node_.id) {
+      return self_node_.ctx;
     }
 
     auto node_iter = peer_node_map_.find(leader_id_);
-    KRAFT_ASSERT(node_iter != peer_node_map_.end(),
-                 "The leader id must be a existed node");
-    KRAFT_ASSERT(node_iter->first == peer_nodes_[node_iter->second].id, "");
+    if (node_iter == peer_node_map_.end()) {
+      return nullptr;
+    }
     return peer_nodes_[node_iter->second].ctx;
+  }
+
+ private:
+  /*--------------------------------------------------*/
+  /* State transition(defined in kraft.cc)            */
+  /*--------------------------------------------------*/
+
+  void BecomeLeader();
+  void BecomeFollower();
+  void BecomeCandidate();
+
+  // The single place where state_ / commit_ change, so that the host
+  // callbacks fire on every transition, no matter which path caused it.
+  void SetRole(RaftRole state);
+  void SetCommit(u64 commit);
+
+  // Called whenever this instance accepts a message from the leader whose
+  // term it currently follows (a valid AppendEntries/heartbeat), or grants
+  // its vote to a candidate. Both reset the election timer.
+  void RecordLeaderContact() noexcept
+  {
+    last_leader_contact_ms_ = NowMs();
+  }
+
+  KRAFT_INLINE bool IsMajorityVoted() const noexcept
+  {
+    return voted_num_ > ((peer_nodes_.size() + 1) >> 1);
   }
 
  private:
@@ -175,6 +294,10 @@ class Raft {
   /*--------------------------------------------------*/
 
   void Log(char const *fmt, ...) const;
+
+  // Extract and log an Error without tripping kerror's unchecked-error
+  // abort: info() marks the error checked.
+  void LogError(char const *what, Error const &err) const;
 
   static ConfChange MakeConfChange(ConfChangeType conf_type, u64 id,
                                    void const *conf_ctx, size_t conf_ctx_len);
@@ -200,10 +323,26 @@ class Raft {
   Error ApplyEntries();
   Error IncrementCommitIndex();
 
+  // Leader -> follower replication. Picks AppendEntries when the peer is
+  // behind, a bare heartbeat otherwise, and reports why nothing was sent.
+  Error SendAppendEntriesTo(u64 node_idx);
+  Error SendHeartBeatTo(u64 node_idx);
+
+  // The single replication core shared by RecvHeartBeatRequest() and
+  // RecvAppendEntriesRequest(): an AppendEntries carrying no entries is a
+  // heartbeat, so both message types take the same path.
+  Error HandleAppendEntriesRequest(Request &request);
+
+  Error HandleAppendEntriesResponse(Response const &response, u64 node_idx);
+
+  // The index the leader should retry from after a rejected AppendEntries,
+  // derived from the follower's hint.
+  std::tuple<u64, u64> ComputeConflictHint(u64 prev_log_index, u64 reject_term) const noexcept;
+
   bool LogState() const;
   void SetId(u64 id);
   void SetVotedFor(u64 id);
-  void SetTerm(u64 term);
+  void SetTerm(u64 new_term);
 
  private:
   std::vector<Node> peer_nodes_;
@@ -211,9 +350,8 @@ class Raft {
   Node self_node_;
 
   // raft state
-  RaftState state_;
+  RaftRole role_ = RaftRole::FOLLOWER;
   PersistentState persistent_state_;
-  u64 entry_index_counter_;
 
   // For redirect
   u64 leader_id_;
@@ -221,8 +359,15 @@ class Raft {
   u64 commit_;
   u64 last_applied_;
 
+  // Host-provided time source and the last moment the leader was heard from
+  Clock clock_;
+  u64 last_leader_contact_ms_ = 0;
+
   // candidate state
   u64 voted_num_;
+  // Ids of the peers that granted their vote in the current election, so a
+  // duplicate or replayed response cannot be counted twice.
+  std::vector<u64> granted_voters_;
   // leader state
   std::vector<u64> next_indices_;
   std::vector<u64> match_indices_;
@@ -264,6 +409,20 @@ class Raft {
 
   // Application layer
   std::function<bool(Entry const *)> log_apply_entry_cb_;
+
+  /*--------------------------------------------------*/
+  /* Host Notification Callback                       */
+  /*--------------------------------------------------*/
+
+  // The host observes the instance through these instead of polling
+  // IsLeader()/commit_index() on its own cadence.
+  //
+  // on_role_change_cb_ fires after state_ has changed, so calling
+  // state()/leader_id() inside the callback observes the new state.
+  std::function<void(RaftRole)> on_role_change_cb_;
+
+  // Fires after commit_ advanced, with the new commit index.
+  std::function<void(u64)> on_commit_index_cb_;
 
   /*--------------------------------------------------*/
   /* IO Callback(Send/Recv Message)                   */

@@ -1,18 +1,86 @@
 // SPDX-LICENSE-IDENTIFIER: BSD-2-Clause
 #include "kraft/kraft.h"
 
-#include <cassert>
+#include <chrono>
 #include <cstdarg>
 #include <cstdio>
+#include <initializer_list>
 
 #include "error_code.h"
 
 using namespace kraft;
 using namespace kerror;
 
-#define CHECK_MESSAGE_(msg_)                                                   \
+namespace {
+
+char const *RoleName(Raft::RaftRole role) noexcept
+{
+  switch (role) {
+    case Raft::RaftRole::FOLLOWER:
+      return "FOLLOWER";
+    case Raft::RaftRole::CANDIDATE:
+      return "CANDIDATE";
+    case Raft::RaftRole::LEADER:
+      return "LEADER";
+  }
+  return "UNKNOWN";
+}
+
+// A reply carries the MSG_*_RES counterpart of the request it answers instead
+// of echoing the request type: the host dispatches on one flat envelope, and
+// every receive path can whitelist the exact type it accepts.
+MessageType ResponseTypeOf(MessageType request_type) noexcept
+{
+  switch (request_type) {
+    case MSG_VOTE:
+      return MSG_VOTE_RES;
+    case MSG_AE:
+      return MSG_AE_RES;
+    case MSG_HEART_BEAT:
+      return MSG_HEART_BEAT_RES;
+    case MSG_ASK_ID:
+      return MSG_ASK_ID_RES;
+    case MSG_NO_OP:
+      return MSG_NO_OP_RES;
+    default:
+      return request_type;
+  }
+}
+
+bool IsMessageTypeIn(MessageType type,
+                     std::initializer_list<MessageType> types) noexcept
+{
+  for (auto t : types) {
+    if (t == type) return true;
+  }
+  return false;
+}
+
+} // namespace
+
+namespace kraft {
+
+u64 SteadyClockMs() noexcept
+{
+  using namespace std::chrono;
+  const auto elapsed = steady_clock::now().time_since_epoch();
+  return static_cast<u64>(duration_cast<milliseconds>(elapsed).count());
+}
+
+} // namespace kraft
+
+// The single entry check of every receive path: the type must be one this
+// path accepts, the message must be addressed to this instance, and the
+// sender must be a known peer. `node_iter` is declared in the caller's scope
+// so the caller can reach the sender's index and context.
+#define CHECK_MESSAGE_(msg_, ...)                                              \
   decltype(peer_node_map_)::iterator node_iter;                                \
   do {                                                                         \
+    if (!IsMessageTypeIn((msg_).type(), {__VA_ARGS__})) {                      \
+      errcode = E_INCORRECT_MESSAGE_TYPE;                                      \
+      return MakeNoInfoError();                                                \
+    }                                                                          \
+                                                                               \
     if ((msg_).to() != self_node_.id) {                                        \
       errcode = E_INCORRECT_TO_NODE;                                           \
       return MakeNoInfoError();                                                \
@@ -37,12 +105,27 @@ void Raft::Log(char const *fmt, ...) const
 
   va_list args;
   va_start(args, fmt);
-  const auto writen = vsprintf(buf, fmt, args);
+  const auto writen = vsnprintf(buf, sizeof(buf), fmt, args);
   if (writen > 0) {
-    log_cb_(buf, writen);
+    const auto n = static_cast<size_t>(writen);
+    log_cb_(buf, n < sizeof(buf) ? n : sizeof(buf) - 1);
   }
 
   va_end(args);
+}
+
+void Raft::LogError(char const *what, Error const &err) const
+{
+  // info() marks the error as checked, which is not optional here: kerror
+  // aborts the process when an error is destroyed unchecked.
+  auto *info = err.info();
+  if (info) {
+    // GetMessage() moves the message out, so it is called exactly once.
+    auto msg = info->GetMessage();
+    Log("%s: %s (errcode = %d)", what, msg.c_str(), errcode);
+    return;
+  }
+  Log("%s: (no detail) errcode = %d", what, errcode);
 }
 
 auto Raft::MakeConfChange(ConfChangeType conf_type, u64 id,
@@ -58,10 +141,11 @@ auto Raft::MakeConfChange(ConfChangeType conf_type, u64 id,
 
 void Raft::InitNextIndices() noexcept
 {
-  KRAFT_ASSERT1(log_get_last_entry_meta_cb_);
-  const auto last_log_index = log_get_last_entry_meta_cb_().index;
+  // Every peer starts from the end of the leader's log: whether it is up to
+  // date is decided by the AppendEntries consistency check, not by guessing.
+  const u64 last_index = last_log_index();
   for (auto &idx : next_indices_) {
-    idx = last_log_index + 1;
+    idx = last_index + 1;
   }
 }
 
@@ -74,11 +158,10 @@ void Raft::InitMatchIndices() noexcept
 
 bool Raft::CheckResponseTerm(Response const &response)
 {
-  // Peer's term is newer than me,
-  // indicates I'm might a stale leader/candidate.
+  // A peer's term is newer than mine, so I am a stale leader/candidate.
   if (response.term() > term()) {
     SetTerm(response.term());
-    if (!IsFollower()) BecomeFollower();
+    BecomeFollower();
     return true; // to stop process, update state
   }
   return false;
@@ -86,19 +169,24 @@ bool Raft::CheckResponseTerm(Response const &response)
 
 bool Raft::CheckRequestTerm(Request &request, Response *response, void *ctx)
 {
-  // AppendEntriest & RequestVote Receiver Impl Rule 1
+  // AppendEntries & RequestVote receiver rule 1
   if (request.term() < term()) {
     response->set_success(false);
     response->set_term(term());
-    Log("Peer term < current term");
+    Log("Peer term (%llu) < current term (%llu)", (ull)request.term(),
+        (ull)term());
+    KRAFT_ASSERT1(send_message_cb_);
     send_message_cb_(response, ctx);
     return true; // to stop process, peer is a stale candidate/leader
   }
 
-  // new leader has later term is OK.
+  // A newer term means the peer is the leader/candidate of that term.
   if (request.term() > term()) {
-    Log("Peer term > current term");
+    Log("Peer term (%llu) > current term (%llu)", (ull)request.term(),
+        (ull)term());
     SetTerm(request.term());
+    // The reply was built before the term changed.
+    response->set_term(term());
   }
   return false;
 }
@@ -112,8 +200,11 @@ bool Raft::IsLogUptodate(u64 term, u64 index) const noexcept
   // request term = 12
   // last entry term = 8
   const auto last_entry_meta = log_get_last_entry_meta_cb_();
+  // The log is up-to-date if its last entry has a higher term than the
+  // request's, or if the terms are equal and its last entry has an equal or
+  // higher index than the request's.
   return term > last_entry_meta.term ||
-         (term == last_entry_meta.term && index > last_entry_meta.index);
+         (term == last_entry_meta.term && index >= last_entry_meta.index);
 }
 
 auto Raft::MakeRequest(MessageType type) const -> Request
@@ -133,34 +224,30 @@ auto Raft::MakeResponse(Request const &request) const -> Response
   Response response;
 
   KRAFT_ASSERT(self_node_.id != INVALID_ID,
-               "The message's id can'bt invalid for response");
+               "The message's id can't be invalid for response");
   response.set_from(self_node_.id);
-  response.set_type(request.type());
+  // `to` is a required field: a response that never sets it cannot even be
+  // serialized, so it must be filled in here rather than by each caller.
+  response.set_to(request.from());
+  response.set_type(ResponseTypeOf(request.type()));
   response.set_term(term());
   return response;
 }
 
 void Raft::SendVoteRequestAll() const
 {
-  const auto last_entry_info = log_get_last_entry_meta_cb_();
-  Request req;
-  req.set_type(MSG_VOTE);
-  KRAFT_ASSERT(self_node_.id != INVALID_ID,
-               "The VoteRequest id can't be invalid");
-  req.set_from(self_node_.id);
+  const auto last_entry_meta = log_get_last_entry_meta_cb_();
+  Request request = MakeRequest(MSG_VOTE);
 
   // Used for checking whether the log is up-to-date or not
-  req.set_log_index(last_entry_info.index);
-  req.set_log_term(last_entry_info.term);
+  request.set_log_index(last_entry_meta.index);
+  request.set_log_term(last_entry_meta.term);
 
-  req.set_term(term());
   for (auto &peer_node : peer_nodes_) {
-    // FIXME voting
-    if (peer_node.IsActive()) {
-      req.set_to(peer_node.id);
-      KRAFT_ASSERT1(send_message_cb_);
-      send_message_cb_(&req, peer_node.ctx);
-    }
+    // FIXME should check peer_node.flags & NODE_ACTIVE
+    request.set_to(peer_node.id);
+    KRAFT_ASSERT1(send_message_cb_);
+    send_message_cb_(&request, peer_node.ctx);
   }
 }
 
@@ -169,60 +256,39 @@ auto Raft::MakeEntry(EntryType type, void const *data, u64 n) -> Entry
   Entry entry;
   entry.set_type(type);
   entry.set_term(term());
-  entry.set_index(entry_index_counter_++);
-  entry.set_data(data, n);
+  // The log is the single source of truth for the index. A counter kept in
+  // the instance drifts as soon as the log is truncated by a conflicting
+  // AppendEntries or replayed from storage on restart.
+  entry.set_index(last_log_index() + 1);
+  if (data != nullptr && n > 0) {
+    entry.set_data(data, n);
+  }
   return entry;
 }
 
 auto Raft::AppendLogEntry(EntryType type, void const *data, u64 n) -> Error
 {
-  KRAFT_ASSERT(IsLeader(), "Only leader can send AE request");
-
-  Entry last_entry = MakeEntry(type, data, n);
-  const auto last_entry_index = last_entry.index();
-  if (!log_append_entry_cb_(last_entry)) {
-    Log("Failed to log entry, stop continue append log");
-    errcode = E_LOG_APPEND_ENTRY;
-    return MakeMsgErrorf("Failed to log entry [%llu]", (ull)last_entry_index);
+  if (!IsLeader()) {
+    errcode = E_NOT_ONLY_LEADER;
+    return MakeMsgError("Only the leader can append an entry");
   }
 
-  KRAFT_ASSERT(last_entry.term() == term(),
-               "The appened log entry must has current term");
-  Request request = MakeRequest(MSG_AE);
-  request.set_commit(commit_);
+  Entry entry = MakeEntry(type, data, n);
+  const u64 entry_index = entry.index();
+  if (!log_append_entry_cb_(entry)) {
+    errcode = E_LOG_APPEND_ENTRY;
+    return MakeMsgErrorf("Failed to log entry [%llu]", (ull)entry_index);
+  }
 
-  // FIXME send size
-  for (u64 i = 0; i < peer_nodes_.size(); ++i) {
-    auto &node = peer_nodes_[i];
-    // FIXME voting
-    if (!node.IsActive()) {
-      continue;
+  Log("Appended entry %llu of term %llu", (ull)entry_index, (ull)term());
+
+  // Replicate immediately instead of waiting for the next heartbeat.
+  for (size_t i = 0; i < peer_nodes_.size(); ++i) {
+    auto err = SendAppendEntriesTo(i);
+    if (err) {
+      LogError("Failed to replicate the new entry", err);
+      return err;
     }
-
-    request.set_to(node.id);
-    u64 start_idx = next_indices_[i];
-    KRAFT_ASSERT(start_idx >= 1, "The next index must >= 1");
-
-    // log index previous new logs
-    request.set_log_index(start_idx - 1);
-    // FIXME cache term?
-    const auto prev_entry_term = log_get_entry_meta_cb_(start_idx - 1);
-    request.set_log_term(prev_entry_term);
-
-    if (start_idx <= last_entry_index)
-      request.mutable_entries()->Reserve(last_entry_index - start_idx + 1);
-    for (; start_idx <= last_entry_index; ++start_idx) {
-      // The storage layer hands back a pointer to its own entry,
-      // so the entry must be copied into the request
-      Entry const *p_entry = nullptr;
-      if (!log_get_entry_cb_(start_idx, &p_entry)) {
-        errcode = E_LOG_GET_ENTRY;
-        return MakeMsgErrorf("Failed to get log entry in %llu", start_idx);
-      }
-      KRAFT_ASSERT(p_entry, "The entry must be non-null on success");
-      *request.mutable_entries()->Add() = *p_entry;
-    }
-    send_message_cb_(&request, node.ctx);
   }
 
   return MakeSuccess();
@@ -231,23 +297,36 @@ auto Raft::AppendLogEntry(EntryType type, void const *data, u64 n) -> Error
 auto Raft::FillAppendEntriesRequest(Request *request, u64 start_idx,
                                     u64 last_entry_index) const -> Error
 {
-  KRAFT_ASSERT(IsLeader(), "Only leader can fill AE request");
+  KRAFT_ASSERT(start_idx >= 1, "The next index must >= 1");
 
+  // The request is reused across peers, so the entries built for the previous
+  // peer must not leak into this one.
+  request->clear_entries();
+
+  // Index 0 is the sentinel of an empty log and must have term 0.
+  // FIXME should append empty entry to log when the log is empty, 
+  // so that the first entry's index is 1.
   request->set_log_index(start_idx - 1);
-  // FIXME cache term?
-  auto prev_entry_term = log_get_entry_meta_cb_(start_idx - 1);
-  request->set_log_term(prev_entry_term);
-  if (start_idx <= last_entry_index)
-    request->mutable_entries()->Reserve(last_entry_index - start_idx + 1);
-  for (; start_idx <= last_entry_index; ++start_idx) {
+  request->set_log_term(log_get_entry_meta_cb_(start_idx - 1));
+
+  if (start_idx > last_entry_index) {
+    return MakeSuccess(); // nothing to replicate, a bare heartbeat
+  }
+
+  request->mutable_entries()->Reserve(
+      static_cast<int>(last_entry_index - start_idx + 1));
+  for (u64 index = start_idx; index <= last_entry_index; ++index) {
     // The storage layer hands back a pointer to its own entry,
     // so the entry must be copied into the request
     Entry const *p_entry = nullptr;
-    if (!log_get_entry_cb_(start_idx, &p_entry)) {
+    if (!log_get_entry_cb_(index, &p_entry)) {
       errcode = E_LOG_GET_ENTRY;
-      return MakeMsgErrorf("Failed to get log entry in %llu", start_idx);
+      return MakeMsgErrorf("Failed to get log entry in %llu", (ull)index);
     }
-    KRAFT_ASSERT(p_entry, "The entry must be non-null on success");
+    if (p_entry == nullptr) {
+      errcode = E_LOG_GET_ENTRY;
+      return MakeMsgErrorf("The log entry in %llu is null", (ull)index);
+    }
     *request->mutable_entries()->Add() = *p_entry;
   }
   return MakeSuccess();
@@ -256,50 +335,60 @@ auto Raft::FillAppendEntriesRequest(Request *request, u64 start_idx,
 auto Raft::AppendConfLogEntry(ConfChangeType type, u64 id, void const *conf_ctx,
                               u64 conf_ctx_len) -> Error
 {
-  auto conf_chg =
-      MakeConfChange(type, id, conf_ctx, conf_ctx_len);
+  auto conf_chg = MakeConfChange(type, id, conf_ctx, conf_ctx_len);
   auto conf_chg_data = conf_chg.SerializeAsString();
   return AppendLogEntry(ENTRY_CONF, conf_chg_data.data(), conf_chg_data.size());
 }
 
 auto Raft::ApplyEntries() -> Error
 {
-  KRAFT_ASSERT(last_applied_ <= commit_,
-               "The last applied index must be <= commit index");
-
-  Entry const *apply_entry = nullptr;
-  for (u64 i = last_applied_ + 1; i <= commit_; ++i) {
-    if (!log_get_entry_cb_(i, &apply_entry)) {
-      errcode = E_LOG_GET_ENTRY;
-      return MakeMsgErrorf("Failed to get log entry in %llu when apply entries",
-                           i);
-    }
-
-    // User should implement how to apply conf change entry and
-    // normal entry(user-defined data)
-    if (!log_apply_entry_cb_(apply_entry)) {
-      errcode = E_LOG_APPLY;
-      return MakeMsgErrorf("Failed to apply log entry in %llu", i);
-    }
-
-    // FIXME Support roll back or allow partial applied?
-    last_applied_++;
+  if (last_applied_ >= commit_) {
+    return MakeSuccess();
   }
 
-  Log("Apply successfully, applied index = %llu", last_applied_);
-  KRAFT_ASSERT(last_applied_ == commit_,
-               "applied index must be same with commit index after apply "
-               "successfully");
+  Entry const *apply_entry = nullptr;
+  for (u64 index = last_applied_ + 1; index <= commit_; ++index) {
+    if (!log_get_entry_cb_(index, &apply_entry)) {
+      errcode = E_LOG_GET_ENTRY;
+      return MakeMsgErrorf("Failed to get log entry in %llu when apply entries",
+                           (ull)index);
+    }
+    if (apply_entry == nullptr) {
+      errcode = E_LOG_GET_ENTRY;
+      return MakeMsgErrorf("The log entry in %llu is null when apply entries",
+                           (ull)index);
+    }
+
+    // The host decides how to apply a conf-change entry and a normal
+    // entry(user-defined data).
+    if (!log_apply_entry_cb_(apply_entry)) {
+      errcode = E_LOG_APPLY;
+      return MakeMsgErrorf("Failed to apply log entry in %llu", (ull)index);
+    }
+
+    // Advance one entry at a time: a failure part-way through must not skip
+    // the entries that already reached the application.
+    last_applied_ = index;
+  }
+
+  Log("Apply successfully, applied index = %llu", (ull)last_applied_);
   return MakeSuccess();
 }
 
 // To expand, make LogState() as a single function call
 bool Raft::LogState() const
 {
+  if (!log_set_state_) {
+    // The instance exists before its host installs the callbacks; nothing to
+    // persist yet, and calling an empty std::function would throw.
+    Log("No persistent-state callback installed, state is not persisted");
+    return false;
+  }
+
   if (!log_set_state_(persistent_state_)) {
     Log("Failed to log state, old state is: (term: %llu, voted_for: %llu, "
         "id: %llu)",
-        term(), voted_for(), id());
+        (ull)term(), (ull)voted_for(), (ull)id());
     return false;
   }
   return true;
@@ -308,38 +397,40 @@ bool Raft::LogState() const
 auto Raft::IncrementCommitIndex() -> Error
 {
   /* Leader Rule 4 */
+  if (!IsLeader()) {
+    return MakeSuccess();
+  }
 
-  auto last_entry_meta = log_get_last_entry_meta_cb_();
+  const auto last_entry_meta = log_get_last_entry_meta_cb_();
 
   // The last entry has the maximum index, its term is old term entry
-  if (last_entry_meta.term != term()) return MakeSuccess();
+  if (last_entry_meta.term != term() || last_entry_meta.index <= commit_) {
+    return MakeSuccess();
+  }
 
-  for (u64 test_index = last_entry_meta.index; test_index > commit_;) {
-    bool is_majority = false;
+  // The leader itself is the first replica of every entry it holds.
+  const u64 majority = ((peer_nodes_.size() + 1) >> 1) + 1;
+
+  for (u64 test_index = last_entry_meta.index; test_index > commit_;
+       --test_index)
+  {
     u64 match_num = 1; // self
-    for (u64 i = 0; i < peer_nodes_.size(); ++i) {
-      if (!peer_nodes_[i].IsActive()) continue;
-
+    for (size_t i = 0; i < peer_nodes_.size(); ++i) {
       if (match_indices_[i] >= test_index) {
-        match_num++;
-
-        is_majority = match_num > ((peer_nodes_.size() + 1) >> 1);
-        if (is_majority) break;
+        ++match_num;
       }
     }
 
-    if (is_majority) {
-      Log("Update commit: %llu", commit_);
-      commit_ = test_index;
+    if (match_num >= majority) {
+      // Rule 4 only lets the leader commit an entry of its own term; older
+      // entries commit implicitly once such an entry does.
+      SetCommit(test_index);
       break;
     }
 
-    --test_index;
-
-    auto entry_term = log_get_entry_meta_cb_(test_index);
-    if (entry_term != term()) {
-      break;
-    }
+    // Walking further back would leave the entries of the current term.
+    if (test_index == 1) break; // FIXME
+    if (log_get_entry_meta_cb_(test_index - 1) != term()) break;
   }
 
   return MakeSuccess();
@@ -363,10 +454,46 @@ void Raft::SetVotedFor(u64 id)
   LogState();
 }
 
-void Raft::SetTerm(u64 term)
+void Raft::SetTerm(u64 new_term)
 {
-  persistent_state_.set_term(term);
+  if (new_term == this->term()) return;
+
+  persistent_state_.set_term(new_term);
+
+  // A new term invalidates the vote of the previous one and any election
+  // this instance was running. voted_for is cleared together with the term in
+  // the same persisted state, otherwise a crash in between could let this
+  // instance vote twice in one term.
+  persistent_state_.set_voted_for(INVALID_VOTED_FOR);
+  voted_num_ = 0;
+  granted_voters_.clear();
+
   LogState();
+}
+
+void Raft::SetRole(RaftRole role)
+{
+  if (role_ == role) return;
+
+  role_ = role;
+  Log("State changed to %s of term %llu", RoleName(role_), (ull)term());
+
+  if (on_role_change_cb_) {
+    on_role_change_cb_(role_);
+  }
+}
+
+void Raft::SetCommit(u64 commit)
+{
+  // The commit index never moves backwards.
+  if (commit <= commit_) return;
+
+  commit_ = commit;
+  Log("Commit index advanced to %llu", (ull)commit_);
+
+  if (on_commit_index_cb_) {
+    on_commit_index_cb_(commit_);
+  }
 }
 
 /*--------------------------------------------------*/
@@ -375,49 +502,74 @@ void Raft::SetTerm(u64 term)
 
 Raft::Raft(size_t peer_node_num)
 {
-  entry_index_counter_ = 1;
-  leader_id_ = -1;
+  leader_id_ = INVALID_ID;
   commit_ = 0;
   last_applied_ = 0;
   voted_num_ = 0;
+  last_leader_contact_ms_ = 0;
+  // role_ is initialized to FOLLOWER by its default member initializer.
 
+  // peer_node_num is a capacity hint only. The index vectors stay exactly as
+  // long as peer_nodes_, so an index into one of them is always valid in all
+  // of them, no matter in which order the host adds its nodes.
   peer_nodes_.reserve(peer_node_num);
   peer_node_map_.reserve(peer_node_num);
+  next_indices_.reserve(peer_node_num);
+  match_indices_.reserve(peer_node_num);
+  granted_voters_.reserve(peer_node_num + 1);
 
-  persistent_state_.set_id(-1);
+  persistent_state_.set_id(INVALID_ID);
   persistent_state_.set_term(0);
-  persistent_state_.set_voted_for(-1);
+  persistent_state_.set_voted_for(INVALID_VOTED_FOR);
 
-  next_indices_.resize(peer_node_num);
-  match_indices_.resize(peer_node_num);
-
-  // Follwer don't initialize next_indices and match_indices
-  BecomeFollower();
-
-  KRAFT_ASSERT1(log_append_entry_cb_);
-  KRAFT_ASSERT1(log_get_last_entry_meta_cb_);
-  KRAFT_ASSERT1(log_get_entry_meta_cb_);
-  KRAFT_ASSERT1(log_truncate_after_cb_);
-  KRAFT_ASSERT1(log_get_entry_cb_);
-  KRAFT_ASSERT1(log_apply_entry_cb_);
-  KRAFT_ASSERT1(log_set_state_);
-  KRAFT_ASSERT1(send_message_cb_);
+  // No LogState() here: the callbacks are installed by the host after
+  // construction, and IsReady() keeps the periodic entry points quiet until
+  // they are.
 }
 
 Raft::~Raft() noexcept { Log("Raft is destoryed"); }
 
 bool Raft::AddPeerNode(u64 id, void *user_ctx)
 {
-  peer_nodes_.emplace_back(id, user_ctx, 0);
-  auto iter_res = peer_node_map_.emplace(id, peer_nodes_.size() - 1);
-  if (!iter_res.second) {
+  if (id == INVALID_ID || id == self_node_.id) {
+    errcode = E_ADD_PEER_NODE;
     return false;
   }
+
+  // Insert into the map first: it owns the id -> index mapping, and a
+  // duplicate that made it into peer_nodes_ would desync every vector that is
+  // indexed alongside it.
+  auto iter_res = peer_node_map_.emplace(id, peer_nodes_.size());
+  if (!iter_res.second) {
+    errcode = E_ADD_PEER_NODE;
+    return false;
+  }
+
+  // Every added peer is an active voter for good: classic Raft never removes
+  // a voter because it is temporarily unreachable, it only stops counting its
+  // replication progress towards the commit index.
+  peer_nodes_.emplace_back(id, user_ctx, NODE_ACTIVE | NODE_VOTING);
+
+  const u64 last_index = last_log_index();
+  next_indices_.push_back(last_index == INVALID_INDEX ? 1 : last_index + 1);
+  match_indices_.push_back(0);
   return true;
 }
 
 bool Raft::AddSelfNode(u64 id, void *user_ctx)
 {
+  if (id == INVALID_ID) {
+    errcode = E_INVALID_REQUEST;
+    return false;
+  }
+
+  if (self_node_.id != INVALID_ID) {
+    // The identity is part of the persisted state; rewriting it would let one
+    // instance impersonate another across a restart.
+    errcode = E_INCORRECT_STATE;
+    return false;
+  }
+
   self_node_.id = id;
   self_node_.ctx = user_ctx;
 
@@ -427,323 +579,422 @@ bool Raft::AddSelfNode(u64 id, void *user_ctx)
 
 void Raft::Periodic()
 {
-  // if (0 == peer_nodes_.size() && !IsLeader()) {
-  //   BecomeLeader();
-  // }
+  if (!IsReady()) return;
 
   if (IsLeader()) {
-    if (!IncrementCommitIndex()) {
-      return;
+    auto err = IncrementCommitIndex();
+    if (err) {
+      LogError("Failed to advance the commit index", err);
     }
   }
 
-  if (!ApplyEntries()) {
-    return;
+  auto err = ApplyEntries();
+  if (err) {
+    LogError("Failed to apply the committed entries", err);
   }
 }
 
-void Raft::ElectionPeriodic() { BecomeCandidate(); }
+void Raft::ElectionPeriodic()
+{
+  if (!IsReady()) return;
+
+  // A leader does not run elections; its own liveness is what the peers time.
+  if (IsLeader()) return;
+
+  BecomeCandidate();
+}
 
 /* Leader Rule 1 */
 void Raft::HeartBeatPeriodic()
 {
-  auto request = MakeRequest(MSG_HEART_BEAT);
-  for (auto &node : peer_nodes_) {
+  if (!IsReady()) return;
+  if (!IsLeader()) return;
+
+  for (size_t i = 0; i < peer_nodes_.size(); ++i) {
+    auto err = SendHeartBeatTo(i);
+    auto &node = peer_nodes_[i];
+    // FIXME
     if (node.IsRecvHeartBeat()) {
       node.flag |= NODE_ACTIVE;
     }
-    request.set_to(node.id);
-    send_message_cb_(&request, node.ctx);
-    node.flag &= ~NODE_RECV_HARTBEAT;
+    if (err) {
+      LogError("Failed to send heartbeat", err);
+    }
+    node.flag &= ~NODE_RECV_HEARTBEAT;
   }
+}
+
+auto Raft::SendAppendEntriesTo(u64 node_idx) -> Error
+{
+  KRAFT_ASSERT(IsLeader(), "Only the leader can replicate");
+  KRAFT_ASSERT(node_idx < peer_nodes_.size(), "Invalid peer node index");
+
+  auto &node = peer_nodes_[node_idx];
+  const u64 last_index = last_log_index();
+
+  // A peer that is behind gets the entries it is missing; a peer that is
+  // caught up only needs the leader's commit index.
+  Request request = MakeRequest(MSG_AE);
+  request.set_to(node.id);
+  request.set_commit(commit_);
+
+  auto err =
+      FillAppendEntriesRequest(&request, next_indices_[node_idx], last_index);
+  if (err) {
+    LogError("Failed to fill the AppendEntries request", err);
+    return err;
+  }
+
+  KRAFT_ASSERT1(send_message_cb_);
+  send_message_cb_(&request, node.ctx);
+  return MakeSuccess();
+}
+
+auto Raft::SendHeartBeatTo(u64 node_idx) -> Error
+{
+  KRAFT_ASSERT(IsLeader(), "Only the leader can send heartbeat");
+  KRAFT_ASSERT(node_idx < peer_nodes_.size(), "Invalid peer node index");
+
+  auto &node = peer_nodes_[node_idx];
+  Request request = MakeRequest(MSG_HEART_BEAT);
+  request.set_to(node.id);
+  request.set_commit(commit_);
+
+  KRAFT_ASSERT1(send_message_cb_);
+  send_message_cb_(&request, node.ctx);
+  return MakeSuccess();
 }
 
 void Raft::BecomeCandidate()
 {
-  KRAFT_ASSERT(!IsLeader() && !IsCandidate(),
-               "Can't convert leader/candidate to candidate");
-  state_ = RaftState::CANDIDATE;
+  // Raft §5.2: a follower that hears nothing from the leader starts a new
+  // election at term + 1. The term and the self-vote are persisted in one
+  // update because the vote is only meaningful together with its term.
+  persistent_state_.set_term(term() + 1);
+  persistent_state_.set_voted_for(self_node_.id);
+  voted_num_ = 0;
+  granted_voters_.clear();
+  LogState();
 
-  // Increment term and start a new election
-  SetTerm(term() + 1);
-  Log("Become candidate of term: %llu", term());
+  SetRole(RaftRole::CANDIDATE);
+  leader_id_ = INVALID_ID;
 
-  KRAFT_ASSERT(voted_num_ == 0, "Vote number must be 0 when become candidate");
+  Log("Become candidate of term: %llu", (ull)term());
 
-  // vote myself
-  // since you also as count by majority
-  voted_num_++;
+  // Vote for self, which is also the first vote counted by majority.
+  granted_voters_.push_back(self_node_.id);
+  voted_num_ = granted_voters_.size();
+
+  // A single-node cluster elects itself without sending anything.
+  if (IsMajorityVoted()) {
+    BecomeLeader();
+    return;
+  }
 
   SendVoteRequestAll();
-
-  // User should reset timer after this be called
 }
 
 void Raft::BecomeLeader()
 {
-  KRAFT_ASSERT(!IsFollower() && !IsLeader(),
-               "Can't convert follwer/leader to leader");
-  state_ = RaftState::LEADER;
-  Log("Voted num = %llu", voted_num_);
-  Log("Become leader of term %llu", term());
+  KRAFT_ASSERT(!IsLeader(), "Can't convert a leader to a leader");
 
-  // reinitialize is necessary
-  // replicate is based on leader current log
+  // Reinitialized before the role-change callback fires: a host that appends
+  // an entry from inside the callback must see the leader's bookkeeping.
   InitNextIndices();
   InitMatchIndices();
+  leader_id_ = self_node_.id;
 
-  // Leader not a follower
-  // avoid persist the voted_for state
-  SetVotedFor(-1);
+  SetRole(RaftRole::LEADER);
+  Log("Voted num = %llu", (ull)voted_num_);
+  Log("Become leader of term %llu", (ull)term());
 
-  // Leader Rule 1
-  HeartBeatPeriodic();
-
-  //
-  if (!AppendNoOpLogEntry()) {
-    Log("Failed to log no-op entry");
+  // Leader Rule 1: an entry of the leader's own term is what carries the
+  // commit index forward (Raft §5.4.2), so append one before replicating.
+  auto err = AppendNoOpLogEntry();
+  if (err) {
+    LogError("Failed to log no-op entry", err);
   }
+
+  // Announce the new leadership to the peers.
+  HeartBeatPeriodic();
 }
 
 void Raft::BecomeFollower()
 {
-  KRAFT_ASSERT(!IsFollower(), "Can't conver follower to follower");
-  state_ = RaftState::FOLLOWER;
-  Log("Become follower of term: %llu", term());
+  // Idempotent: several paths step down, and only one of them changes state.
+  SetRole(RaftRole::FOLLOWER);
+  leader_id_ = INVALID_ID;
 
-  // reset election state
+  // Reset the election state of a previous candidacy. voted_for is *not*
+  // reset: it is per term, and it is written by SetTerm()/BecomeCandidate().
   voted_num_ = 0;
-  SetVotedFor(-1);
+  granted_voters_.clear();
 }
 
-// Follower
+/*--------------------------------------------------*/
+/* Receive paths                                    */
+/*--------------------------------------------------*/
+
+// Follower/Candidate
 auto Raft::RecvVoteRequest(Request &request) -> Error
 {
-  // Ignore leader
+  // A leader never grants a vote without stepping down first.
   if (IsLeader()) {
     return MakeSuccess();
   }
 
-  CHECK_MESSAGE_(request);
+  CHECK_MESSAGE_(request, MSG_VOTE);
 
-  Response response;
-  response.set_to(request.from());
-  response.set_from(self_node_.id);
-  response.set_type(request.type());
+  auto &node = peer_nodes_[node_iter->second];
+  Response response = MakeResponse(request);
+  response.set_success(false);
 
-  // First check term
-  // RequestVote RPC - Receiver Impl rule 1
-  auto ctx = peer_nodes_[node_iter->second].ctx;
-
-  // CheckRequestTerm has handle this request
-  // return OK is ok.
-  if (CheckRequestTerm(request, &response, ctx)) {
+  // RequestVote receiver rule 1: reject a stale term, telling the candidate
+  // the current one.
+  if (CheckRequestTerm(request, &response, node.ctx)) {
     return MakeSuccess();
   }
 
-  // If self node don't vote any node or
-  // the voted node don't receive the response(peer send request again),
-  // consider vote it and send response.
-  if ((voted_for() == INVALID_VOTED_FOR || voted_for() == request.from()) &&
-      IsLogUptodate(request.log_term(), request.log_index()))
-  {
+  // A candidate that hears another candidate of its own term keeps its own
+  // candidacy; only a newer term (handled above) demotes it.
+
+  const bool is_votable =
+      voted_for() == INVALID_VOTED_FOR || voted_for() == request.from();
+  if (is_votable && IsLogUptodate(request.log_term(), request.log_index())) {
     SetVotedFor(request.from());
     response.set_success(true);
-  } else {
-    KRAFT_ASSERT(voted_for() != INVALID_VOTED_FOR &&
-                     peer_node_map_.find(voted_for()) != peer_node_map_.end(),
-                 "Voted for is an invalid node id");
-    response.set_success(false);
+    // Granting a vote resets the election timer: otherwise the candidate
+    // would time out again in the middle of the election it just joined.
+    RecordLeaderContact();
   }
 
-  send_message_cb_(&response, ctx);
+  KRAFT_ASSERT1(send_message_cb_);
+  send_message_cb_(&response, node.ctx);
   return MakeSuccess();
 }
 
 auto Raft::RecvVoteResponse(Response &response) -> Error
 {
-  // The node has become leader
-  // ignore the vote response.
-  if (IsLeader()) {
-    return MakeSuccess();
-  }
-
-  // Start a new election
+  // The election is over for this instance, either way.
+  // Indicates the role has changed to follower or leader, ignore it.
   if (!IsCandidate()) {
-    KRAFT_ASSERT1(voted_for() == INVALID_VOTED_FOR);
-    KRAFT_ASSERT1(voted_num_ == 0);
-    // errcode = E_INCORRECT_STATE;
     return MakeSuccess();
   }
-  KRAFT_ASSERT(response.has_success(),
-               "response must has the 'success' fields");
 
-  auto node_iter = peer_node_map_.find(response.from());
-  if (node_iter == peer_node_map_.end()) {
-    errcode = E_NODE_NONEXISTS;
-    return MakeNoInfoError();
+  CHECK_MESSAGE_(response, MSG_VOTE_RES);
+
+  auto &node = peer_nodes_[node_iter->second];
+
+  if (CheckResponseTerm(response)) {
+    return MakeSuccess();
   }
 
-  if (response.success()) {
-    voted_num_++;
-    if (IsMajorityVoted()) {
-      BecomeLeader();
+  // 检测消息不应用assert(has_success())，不清楚对端会塞什么
+  if (!response.has_success() || !response.success()) {
+    return MakeSuccess();
+  }
+
+  // Count each voter at most once: a replayed or forged duplicate must not
+  // manufacture a majority.
+  for (auto voter : granted_voters_) {
+    if (voter == node.id) {
+      return MakeSuccess();
     }
-    return MakeSuccess();
   }
+  granted_voters_.push_back(node.id);
+  voted_num_ = granted_voters_.size();
+  Log("Receive the vote of %llu, voted num = %llu", (ull)node.id,
+      (ull)voted_num_);
 
-  KRAFT_ASSERT1(!response.success());
-
-  SetTerm(KRAFT_MAX(term(), response.term()));
+  if (IsMajorityVoted()) {
+    BecomeLeader();
+  }
   return MakeSuccess();
 }
 
 auto Raft::RecvHeartBeatResponse(Response &response) -> Error
 {
+  // A reply that arrives after this instance stopped being the leader has
+  // nothing to say, and is not an error.
+  // 在发和收心跳之间，可能有其他节点发起选举，导致本节点降级为follower
   if (!IsLeader()) {
-    errcode = E_INCORRECT_STATE;
     return MakeSuccess();
   }
 
-  CHECK_MESSAGE_(response);
-
-  auto &node = peer_nodes_[node_iter->second];
+  CHECK_MESSAGE_(response, MSG_HEART_BEAT_RES);
 
   if (CheckResponseTerm(response)) {
     return MakeSuccess();
   }
 
-  leader_id_ = response.from();
-  node.flag |= NODE_RECV_HARTBEAT;
-  return MakeSuccess();
+  return HandleAppendEntriesResponse(response, node_iter->second);
 }
 
 auto Raft::RecvHeartBeatRequest(Request &request) -> Error
 {
-  KRAFT_ASSERT(!IsLeader(), "Leader receive AppendEntries Request");
-  if (IsCandidate()) {
-    Log("Candidate receive Heart Beat Request from current leader: %llu",
-        request.term());
-    BecomeFollower();
-  }
-
-  CHECK_MESSAGE_(request);
-
-  auto &node = peer_nodes_[node_iter->second];
-
-  Response response;
-  if (CheckRequestTerm(request, &response, node.ctx)) {
-    return MakeSuccess();
-  }
-
-  response.set_success(true);
-  response.set_from(self_node_.id);
-  response.set_to(request.from());
-  response.set_term(term());
-  send_message_cb_(&response, node.ctx);
-  return MakeSuccess();
+  return HandleAppendEntriesRequest(request);
 }
 
 auto Raft::RecvAppendEntriesResponse(Response &response) -> Error
 {
   if (!IsLeader()) {
-    errcode = E_INCORRECT_STATE;
     return MakeSuccess();
   }
 
-  CHECK_MESSAGE_(response);
-
-  // auto &node = peer_nodes_[node_iter->second];
+  CHECK_MESSAGE_(response, MSG_AE_RES);
 
   if (CheckResponseTerm(response)) {
     return MakeSuccess();
   }
 
-  const auto peer_id = response.from();
-  const auto node_idx = node_iter->second;
-  if (response.success()) {
-    // Peer has log these entries logs to its log
-    auto entries_num = response.hint();
-    next_indices_[node_idx] = entries_num;
-    match_indices_[node_idx] = entries_num - 1;
-  } else {
-    auto conflict_num = response.hint();
-    match_indices_[node_idx] = next_indices_[node_idx] - conflict_num;
-    next_indices_[node_idx] -= conflict_num;
-
-    auto request = MakeRequest(MSG_AE);
-    request.set_to(peer_id);
-    request.set_commit(commit_);
-    auto last_entry_meta = log_get_last_entry_meta_cb_();
-    FillAppendEntriesRequest(&request, next_indices_[node_idx],
-                             last_entry_meta.index);
-    Log("Retry send AE request [%llu, %llu]", next_indices_[node_idx],
-        last_entry_meta);
-    send_message_cb_(&request, peer_nodes_[node_iter->second].ctx);
-  }
-
-  leader_id_ = response.from();
-  return MakeSuccess();
+  return HandleAppendEntriesResponse(response, node_iter->second);
 }
 
 auto Raft::RecvAppendEntriesRequest(Request &request) -> Error
 {
-  KRAFT_ASSERT(!IsLeader(), "Leader receive AppendEntries Request");
-  if (IsCandidate()) {
-    Log("Candidate receive AppendEntriest Request from current leader: %llu",
-        request.term());
-    BecomeFollower();
+  return HandleAppendEntriesRequest(request);
+}
+
+// Leader
+auto Raft::HandleAppendEntriesResponse(Response const &response, u64 node_idx)
+    -> Error
+{
+  auto &node = peer_nodes_[node_idx];
+
+  // Nothing to learn from a reply without a verdict: leave the peer's next
+  // index untouched so the next heartbeat retries.
+  if (!response.has_success()) {
+    return MakeSuccess();
   }
 
-  CHECK_MESSAGE_(request);
+  if (response.success()) {
+    // The follower's hint is the last index its log now agrees with the
+    // leader on, so match/next follow from it instead of from a guess.
+    const u64 matched = response.hint();
+    if (matched > match_indices_[node_idx]) {
+      match_indices_[node_idx] = matched;
+    }
+    next_indices_[node_idx] = matched + 1;
+    Log("Peer %llu matched through %llu", (ull)node.id, (ull)matched);
+    return MakeSuccess();
+  }
+
+  // The follower rejected the request; its hint is the index to retry from,
+  // clamped so it always moves backwards and never leaves the log.
+  const u64 last_index = last_log_index();
+  const auto [ hint_index, _ ] = ComputeConflictHint(response.hint(), response.log_term());
+  u64 next_index = KRAFT_MAX(hint_index, static_cast<u64>(1));
+  if (next_index > last_index + 1) {
+    next_index = last_index + 1;
+  }
+  next_indices_[node_idx] = next_index;
+  Log("Peer %llu rejected the AppendEntries, retry from %llu", (ull)node.id,
+      (ull)next_index);
+
+  // Retry immediately instead of waiting for the next heartbeat.
+  return SendAppendEntriesTo(node_idx);
+}
+
+// follower/candidate
+auto Raft::HandleAppendEntriesRequest(Request &request) -> Error
+{
+  CHECK_MESSAGE_(request, MSG_AE, MSG_HEART_BEAT);
 
   auto &node = peer_nodes_[node_iter->second];
+  Response response = MakeResponse(request);
+  response.set_success(false);
 
-  Response response;
+  // Receiver rule 1: reply false to a stale term without touching the log.
   if (CheckRequestTerm(request, &response, node.ctx)) {
     return MakeSuccess();
   }
 
-  response.set_from(self_node_.id);
-  response.set_to(request.to());
-  response.set_term(term());
+  // The sender's term is current, so it is the leader of this term and any
+  // candidacy of this instance is over (Raft §5.2).
+  BecomeFollower();
+  leader_id_ = request.from();
+  // A valid AppendEntries/heartbeat of the current term resets the election
+  // timer, whether or not the log check below passes.
+  RecordLeaderContact();
 
-  // AE impl Rule 2
-  auto check_term = log_get_entry_meta_cb_(request.log_index());
-  if (check_term != request.log_term()) {
-    response.set_success(false);
+  const u64 prev_index = request.log_index();
+  const u64 entries_size = static_cast<u64>(request.entries_size());
+
+  // Receiver rule 2: the entry preceding the new ones must match. Index 0 is
+  // the sentinel of an empty log and has term 0 on both sides.
+  // 检查prevLogEntry是否存在，且term是否匹配
+  const u64 term_in_prev_index = log_get_entry_meta_cb_(prev_index);
+  if (prev_index > last_log_index() || term_in_prev_index != request.log_term()) {
+    const auto [ hint_index, hint_term ] = ComputeConflictHint(prev_index, request.log_term());
+    response.set_hint(hint_index);
+    response.set_log_term(hint_term);
+    Log("Reject the AppendEntries of %llu: no entry at %llu of term %llu",
+        (ull)node.id, (ull)prev_index, (ull)request.log_term());
+    KRAFT_ASSERT1(send_message_cb_);
+    send_message_cb_(&response, node.ctx);
+    return MakeSuccess();
   }
 
-  const u64 entry_num = request.entries_size();
-  bool need_check_term = true;
-  for (u64 i = request.log_index() + 1; i < entry_num; ++i) {
-    if (need_check_term) {
-      check_term = log_get_entry_meta_cb_(i);
-      if (check_term == INVALID_TERM) {
-        // AE impl Rule 4
-        log_append_entry_cb_(const_cast<Entry &>(request.entries()[i]));
-        need_check_term = false;
-      } else if (check_term != request.entries()[i].term()) {
-        // AE impl Rule 3
-        if (!log_truncate_after_cb_(i)) {
-          errcode = E_TRUNCATE;
-          return MakeMsgErrorf("Failed to truncate the log in %llu\n", (ull)i);
-        }
+  // Rules 3 and 4: skip the entries already in the log, then truncate the
+  // first one that conflicts and append everything from there on.
+  u64 index = prev_index;
+  for (int i = 0; i < request.entries_size(); ++i) {
+    Entry const &entry = request.entries(i);
+    ++index;
+
+    const u64 local_term = log_get_entry_meta_cb_(index);
+    if (local_term != INVALID_TERM && local_term == entry.term()) {
+      continue; // an old entry that is already replicated, keep it
+    }
+
+    if (local_term != INVALID_TERM) {
+      // Rule 3: delete the conflicting entry and everything after it. The
+      // callback keeps the log *through* the given index.
+      // FIXME index?
+      if (!log_truncate_after_cb_(index - 1)) {
+        errcode = E_TRUNCATE;
+        return MakeMsgErrorf("Failed to truncate the log after %llu",
+                             (ull)(index - 1));
       }
-    } else {
-      log_append_entry_cb_(const_cast<Entry &>(request.entries()[i]));
     }
 
-    // AE Impl Rule 5
-    if (request.commit() > commit_) {
-      commit_ =
-          KRAFT_MIN(request.commit(),
-                    request.entries()[request.entries_size() - 1].index());
+    for (int j = i; j < request.entries_size(); ++j) {
+      // The storage layer may take ownership of the entry, hence the
+      // non-const access, but the wire message itself is not modified.
+      Entry &append_entry = *request.mutable_entries(j);
+      if (!log_append_entry_cb_(append_entry)) {
+        errcode = E_LOG_APPEND_ENTRY;
+        return MakeMsgErrorf("Failed to append the log entry at index %llu",
+                             (ull)append_entry.index());
+      }
     }
+    break;
   }
 
+  // Rule 5: advance the commit index, but never past the last index this
+  // request proved the leader holds.
+  const u64 last_new_index = prev_index + entries_size;
+  SetCommit(KRAFT_MIN(request.commit(), last_new_index));
+
+  // On success the hint is the index the follower's log now agrees with the
+  // leader on.
+  response.set_success(true);
+  response.set_hint(last_new_index);
+  response.set_term(term());
+  KRAFT_ASSERT1(send_message_cb_);
   send_message_cb_(&response, node.ctx);
   return MakeSuccess();
+}
+
+auto Raft::ComputeConflictHint(u64 prev_log_index, u64 peer_reject_term) const noexcept -> std::tuple<u64, u64>
+{
+  const u64 last_index = last_log_index();
+
+  auto hint_index = KRAFT_MIN(prev_log_index, last_index);
+  while (hint_index > 1 && log_get_entry_meta_cb_(hint_index - 1) > peer_reject_term) {
+    --hint_index;
+  }
+  return { hint_index, log_get_entry_meta_cb_(hint_index)};
 }
 
 auto Raft::AppendLog(void const *data, size_t n) -> Error
@@ -759,7 +1010,10 @@ auto Raft::AppendConfChangeLog(u64 id, void const *conf_ctx, size_t n) -> Error
 auto Raft::AskNodeId(void *user_ctx) -> Error
 {
   Request request = MakeRequest(MSG_ASK_ID);
-  // request.set_commit(commit_);
+  // `to` is a required field and the responder is not known yet, so the
+  // message is addressed to nobody and the responder answers the sender.
+  request.set_to(INVALID_ID);
+  KRAFT_ASSERT1(send_message_cb_);
   send_message_cb_(&request, user_ctx);
 
   return MakeSuccess();
@@ -767,22 +1021,29 @@ auto Raft::AskNodeId(void *user_ctx) -> Error
 
 auto Raft::RecvAskNodeResponse(Response &response, void *user_ctx) -> Error
 {
+  if (response.type() != MSG_ASK_ID_RES) {
+    errcode = E_INCORRECT_MESSAGE_TYPE;
+    return MakeNoInfoError();
+  }
+
   if (response.to() != self_node_.id) {
     errcode = E_INVALID_RESPONSE;
     return MakeNoInfoError();
   }
 
-  auto node_iter = peer_node_map_.find(response.from());
-  if (node_iter != peer_node_map_.end()) {
-    // Has added, ignore this response
-    // Maybe a duplicate message since network problem.
+  if (response.from() == self_node_.id || response.from() == INVALID_ID) {
+    errcode = E_INVALID_RESPONSE;
+    return MakeNoInfoError();
+  }
+
+  // Has added, ignore this response
+  // Maybe a duplicate message since network problem.
+  if (peer_node_map_.find(response.from()) != peer_node_map_.end()) {
     return MakeSuccess();
   }
 
-  peer_nodes_.emplace_back(response.from(), user_ctx);
-  if (!peer_node_map_.emplace(response.from(), peer_nodes_.size() - 1).second) {
-    errcode = E_ADD_PEER_NODE;
-    return MakeNoInfoError();
+  if (!AddPeerNode(response.from(), user_ctx)) {
+    return MakeNoInfoError(); // errcode is set by AddPeerNode()
   }
   return MakeSuccess();
 }

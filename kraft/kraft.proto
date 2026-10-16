@@ -71,6 +71,7 @@ message Message
   // last_log_index for vote; prev_log_index for append
   optional uint64 log_index = 5;
   // last_log_term for vote; prev_log_term for append
+  // AppendEntries Response: hint_term
   optional uint64 log_term = 6;
   optional uint64 commit = 7; // for append
   repeated Entry entries = 8; // for append
