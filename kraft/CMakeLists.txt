@@ -17,7 +17,8 @@ file(GLOB_RECURSE
   storage/raft_log_buffer_pool.cc
   storage/buffer_pool_log.cc
   kraft.cc
-  ${3_PARTY_DIR}/kerror/kerror.cc 
+  raft_driver.cc
+  ${3_PARTY_DIR}/kerror/kerror.cc
 )
 
 kraft_gen_lib(kraft
