@@ -729,8 +729,11 @@ void Raft::BecomeCandidate()
   granted_voters_.clear();
   LogState();
 
-  SetRole(RaftRole::CANDIDATE);
+  // Cleared before the role-change callback fires, like BecomeLeader() sets
+  // leader_id_ before it: a host that reads leader_id() from inside the
+  // callback must not see the leader of the term this candidacy just left.
   leader_id_ = INVALID_ID;
+  SetRole(RaftRole::CANDIDATE);
 
   Log("Become candidate of term: %llu", (ull)term());
 
@@ -774,9 +777,12 @@ void Raft::BecomeLeader()
 
 void Raft::BecomeFollower()
 {
+  // Cleared before the role-change callback fires, so that a host reading
+  // role()/leader_id() inside it observes the new state, as kraft.h promises.
+  leader_id_ = INVALID_ID;
+
   // Idempotent: several paths step down, and only one of them changes state.
   SetRole(RaftRole::FOLLOWER);
-  leader_id_ = INVALID_ID;
 
   // Reset the election state of a previous candidacy. voted_for is *not*
   // reset: it is per term, and it is written by SetTerm()/BecomeCandidate().
