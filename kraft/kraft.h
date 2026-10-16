@@ -93,6 +93,35 @@ class Raft {
   bool AddSelfNode(u64 id, void *user_ctx = nullptr);
 
   /**
+   * \brief Load the persisted state back into a restarted instance.
+   *
+   * \param self_id The id this instance is restarting as. It is only checked
+   * against the id stored alongside the state; it is not installed here,
+   * because AddSelfNode() stays the single place an identity is claimed.
+   *
+   * Call it once, after installing log_get_state_cb_ and *before*
+   * AddSelfNode(): AddSelfNode() persists the identity it is handed, and
+   * doing that first would overwrite the term/vote being recovered.
+   *
+   * The state is assigned rather than applied: no role-change and no
+   * commit-index callback fires, and nothing is written back, because what is
+   * already on disk is exactly the recovered state. The role stays FOLLOWER
+   * (a restarted instance never resumes leadership) and the instance looks
+   * untouched by a leader, so the election timer starts from now.
+   *
+   * \errno E_INVALID_REQUEST if self_id is INVALID_ID.
+   * \errno E_INCORRECT_STATE if log_get_state_cb_ is not installed, if
+   * recovery already ran, if AddSelfNode() already claimed an identity, if
+   * the instance was already driven, or if the persisted id is not self_id.
+   *
+   * \note The commit index is not persisted (kraft.proto keeps that field
+   * commented out), so the application replays from index 1: the host's
+   * log_apply_entry_cb_ must be idempotent, or it must skip what it has
+   * already applied by its own bookkeeping.
+   */
+  Error Recover(u64 self_id);
+
+  /**
    * \brief
    *
    * \param user_ctx
@@ -352,6 +381,10 @@ class Raft {
   RaftRole role_ = RaftRole::FOLLOWER;
   PersistentState persistent_state_;
 
+  // Recover() is a one-shot startup step: the second call would silently
+  // replace a state the instance has already been making decisions with.
+  bool recover_done_ = false;
+
   // For redirect
   u64 leader_id_;
 
@@ -397,6 +430,19 @@ class Raft {
   // Storage layer
   std::function<bool(Entry &entry)> log_append_entry_cb_;
   std::function<bool(PersistentState const &state)> log_set_state_;
+
+  // Reads back what log_set_state_() wrote, so a restarted instance can resume
+  // the term it left instead of restarting from term 0, which would let it
+  // vote a second time in a term it already voted in (Raft §5.2).
+  //
+  // Return false when nothing was ever persisted, i.e. a brand-new node;
+  // Recover() then keeps the fresh state the constructor installed.
+  //
+  // Deliberately not part of IsReady(): a host that never restarts its
+  // instances has no use for it, and requiring it would silence every host
+  // and test that is already wired up. Recover() checks it itself.
+  std::function<bool(PersistentState *state)> log_get_state_cb_;
+
   std::function<EntryMeta()> log_get_last_entry_meta_cb_;
   std::function<u64(u64 index)> log_get_entry_meta_cb_;
   std::function<bool(u64 index)> log_truncate_after_cb_;
@@ -417,7 +463,7 @@ class Raft {
   // IsLeader()/commit_index() on its own cadence.
   //
   // on_role_change_cb_ fires after state_ has changed, so calling
-  // state()/leader_id() inside the callback observes the new state.
+  // role()/leader_id() inside the callback observes the new state.
   std::function<void(RaftRole)> on_role_change_cb_;
 
   // Fires after commit_ advanced, with the new commit index.

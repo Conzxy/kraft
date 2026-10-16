@@ -580,6 +580,67 @@ bool Raft::AddSelfNode(u64 id, void *user_ctx)
   return true;
 }
 
+auto Raft::Recover(u64 self_id) -> Error
+{
+  if (self_id == INVALID_ID) {
+    errcode = E_INVALID_REQUEST;
+    return MakeMsgError("The self id to recover as must be a valid id");
+  }
+
+  if (!log_get_state_cb_) {
+    errcode = E_INCORRECT_STATE;
+    return MakeMsgError("No persistent-state read callback is installed, "
+                        "the state can't be recovered");
+  }
+
+  if (recover_done_) {
+    errcode = E_INCORRECT_STATE;
+    return MakeMsgError("The persistent state has already been recovered");
+  }
+
+  if (self_node_.id != INVALID_ID) {
+    errcode = E_INCORRECT_STATE;
+    return MakeMsgError("AddSelfNode() ran before Recover(): it persists the "
+                        "identity it was given, so the state to recover has "
+                        "already been overwritten");
+  }
+
+  // Anything already driven was driven on the constructor's fresh state, and
+  // a recovered term would contradict the decisions it made in the meantime.
+  if (term() != 0 || commit_ != 0 || last_applied_ != 0) {
+    errcode = E_INCORRECT_STATE;
+    return MakeMsgError("The instance has already been driven, it's too late "
+                        "to recover its persistent state");
+  }
+
+  PersistentState persisted;
+  if (!log_get_state_cb_(&persisted)) {
+    // A node that never ran before: nothing was persisted, so the fresh state
+    // the constructor installed is the right one. Not an error.
+    recover_done_ = true;
+    Log("No persistent state to recover, starting from a fresh state");
+    return MakeSuccess();
+  }
+
+  if (persisted.id() != self_id) {
+    errcode = E_INCORRECT_STATE;
+    return MakeMsgErrorf("The persisted state belongs to node %llu, not to "
+                         "node %llu",
+                         (ull)persisted.id(), (ull)self_id);
+  }
+
+  // Assign instead of SetTerm()/SetId(): recovery is not a state transition,
+  // so it must not fire a notification callback, and there is nothing to
+  // persist, the recovered state being what is already on disk.
+  persistent_state_ = persisted;
+  recover_done_ = true;
+
+  Log("Recovered the persistent state: term = %llu, voted_for = %llu, "
+      "id = %llu",
+      (ull)term(), (ull)voted_for(), (ull)id());
+  return MakeSuccess();
+}
+
 void Raft::Periodic()
 {
   if (!IsReady()) return;
