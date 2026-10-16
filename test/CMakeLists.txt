@@ -9,7 +9,7 @@ if (NOT ${BUILD_ALL_TESTS})
   message(STATUS "[The kraft test and bench files are excluded from the build of target all]")
 endif (NOT ${BUILD_ALL_TESTS})
 
-message(STATUS "kraft protoc = ${kraft-protoc}")
+message(STATUS "kraft protoc = ${Protobuf_PROTOC_EXECUTABLE}")
 ############################################
 # generate test and bench program
 ############################################
@@ -22,7 +22,7 @@ macro (GenTest SRC)
     list(APPEND test_sources ${kraft_test_source})
     set(proto_file "${kraft_test_file_dir}/${kraft_test_filename}.proto")
     if (EXISTS ${proto_file})
-      gen_proto_code(PROTOC_PATH ${kraft-protoc} FILES ${proto_file})
+      gen_proto_code(PROTOC_PATH ${Protobuf_PROTOC_EXECUTABLE} FILES ${proto_file})
       list(APPEND test_sources ${kraft_test_filename}.pb.cc)
     endif ()
 
@@ -52,8 +52,10 @@ endmacro()
 find_package(GTest CONFIG REQUIRED)
 find_package(benchmark CONFIG REQUIRED)
 
-set(TEST_LIBS kraft kraft_protobuf)
-set(BENCH_LIBS kraft kraft_protobuf)
+#set(TEST_LIBS kraft kraft_protobuf)
+#set(BENCH_LIBS kraft kraft_protobuf)
+set(TEST_LIBS kraft protobuf::libprotobuf)
+set(BENCH_LIBS kraft protobuf::libprotobuf)
 
 GenTest(KRAFT_TEST_SOURCES GTest::gtest GTest::gtest_main ${TEST_LIBS})
 GenTest(KRAFT_BENCH_SOURCES benchmark benchmark_main ${BENCH_LIBS})

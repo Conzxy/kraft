@@ -1,11 +1,11 @@
 set(PB_OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR})
 message(STATUS "kraft pb code files output dir = ${PB_OUTPUT_DIR}")
 
-find_package(Protobuf REQUIRED)
+find_package(Protobuf REQUIRED CONFIG)
 # Requires this protoc to generate kraft.pb.*
 # User must link higher version protobuf lib to against this if 
 # the `KRAFT_LINK_PROTOBUF` is specified as OFF
-gen_proto_code(PROTOC_PATH ${PROTOBUF_PROTOC_EXECUTABLE} FILES "${CMAKE_CURRENT_SOURCE_DIR}/kraft.proto")
+gen_proto_code(PROTOC_PATH ${Protobuf_PROTOC_EXECUTABLE} FILES "${CMAKE_CURRENT_SOURCE_DIR}/kraft.proto")
 
 file(GLOB_RECURSE
   KRAFT_SOURCES

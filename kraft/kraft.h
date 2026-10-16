@@ -325,8 +325,7 @@ class Raft {
 
   // Leader -> follower replication. Picks AppendEntries when the peer is
   // behind, a bare heartbeat otherwise, and reports why nothing was sent.
-  Error SendAppendEntriesTo(u64 node_idx);
-  Error SendHeartBeatTo(u64 node_idx);
+  Error SendAppendEntriesTo(u64 node_idx, MessageType msg_type = MSG_AE);
 
   // The single replication core shared by RecvHeartBeatRequest() and
   // RecvAppendEntriesRequest(): an AppendEntries carrying no entries is a

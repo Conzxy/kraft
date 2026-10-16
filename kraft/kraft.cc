@@ -7,6 +7,7 @@
 #include <initializer_list>
 
 #include "error_code.h"
+#include "kraft.pb.h"
 
 using namespace kraft;
 using namespace kerror;
@@ -313,21 +314,23 @@ auto Raft::FillAppendEntriesRequest(Request *request, u64 start_idx,
     return MakeSuccess(); // nothing to replicate, a bare heartbeat
   }
 
-  request->mutable_entries()->Reserve(
-      static_cast<int>(last_entry_index - start_idx + 1));
-  for (u64 index = start_idx; index <= last_entry_index; ++index) {
-    // The storage layer hands back a pointer to its own entry,
-    // so the entry must be copied into the request
-    Entry const *p_entry = nullptr;
-    if (!log_get_entry_cb_(index, &p_entry)) {
-      errcode = E_LOG_GET_ENTRY;
-      return MakeMsgErrorf("Failed to get log entry in %llu", (ull)index);
+  if (request->type() == MSG_AE) {
+    request->mutable_entries()->Reserve(
+        static_cast<int>(last_entry_index - start_idx + 1));
+    for (u64 index = start_idx; index <= last_entry_index; ++index) {
+      // The storage layer hands back a pointer to its own entry,
+      // so the entry must be copied into the request
+      Entry const *p_entry = nullptr;
+      if (!log_get_entry_cb_(index, &p_entry)) {
+        errcode = E_LOG_GET_ENTRY;
+        return MakeMsgErrorf("Failed to get log entry in %llu", (ull)index);
+      }
+      if (p_entry == nullptr) {
+        errcode = E_LOG_GET_ENTRY;
+        return MakeMsgErrorf("The log entry in %llu is null", (ull)index);
+      }
+      *request->mutable_entries()->Add() = *p_entry;
     }
-    if (p_entry == nullptr) {
-      errcode = E_LOG_GET_ENTRY;
-      return MakeMsgErrorf("The log entry in %llu is null", (ull)index);
-    }
-    *request->mutable_entries()->Add() = *p_entry;
   }
   return MakeSuccess();
 }
@@ -611,7 +614,7 @@ void Raft::HeartBeatPeriodic()
   if (!IsLeader()) return;
 
   for (size_t i = 0; i < peer_nodes_.size(); ++i) {
-    auto err = SendHeartBeatTo(i);
+    auto err = SendAppendEntriesTo(i, MSG_HEART_BEAT);
     auto &node = peer_nodes_[i];
     // FIXME
     if (node.IsRecvHeartBeat()) {
@@ -624,17 +627,21 @@ void Raft::HeartBeatPeriodic()
   }
 }
 
-auto Raft::SendAppendEntriesTo(u64 node_idx) -> Error
+auto Raft::SendAppendEntriesTo(u64 node_idx, MessageType type) -> Error
 {
   KRAFT_ASSERT(IsLeader(), "Only the leader can replicate");
   KRAFT_ASSERT(node_idx < peer_nodes_.size(), "Invalid peer node index");
+  if (type != MSG_AE && type != MSG_HEART_BEAT) {
+    errcode = E_INCORRECT_MESSAGE_TYPE;
+    return MakeMsgError("The message type must be MSG_AE or MSG_HEART_BEAT");
+  }
 
   auto &node = peer_nodes_[node_idx];
   const u64 last_index = last_log_index();
 
   // A peer that is behind gets the entries it is missing; a peer that is
   // caught up only needs the leader's commit index.
-  Request request = MakeRequest(MSG_AE);
+  Request request = MakeRequest(type);
   request.set_to(node.id);
   request.set_commit(commit_);
 
@@ -644,21 +651,6 @@ auto Raft::SendAppendEntriesTo(u64 node_idx) -> Error
     LogError("Failed to fill the AppendEntries request", err);
     return err;
   }
-
-  KRAFT_ASSERT1(send_message_cb_);
-  send_message_cb_(&request, node.ctx);
-  return MakeSuccess();
-}
-
-auto Raft::SendHeartBeatTo(u64 node_idx) -> Error
-{
-  KRAFT_ASSERT(IsLeader(), "Only the leader can send heartbeat");
-  KRAFT_ASSERT(node_idx < peer_nodes_.size(), "Invalid peer node index");
-
-  auto &node = peer_nodes_[node_idx];
-  Request request = MakeRequest(MSG_HEART_BEAT);
-  request.set_to(node.id);
-  request.set_commit(commit_);
 
   KRAFT_ASSERT1(send_message_cb_);
   send_message_cb_(&request, node.ctx);
@@ -868,14 +860,16 @@ auto Raft::HandleAppendEntriesResponse(Response const &response, u64 node_idx)
   }
 
   if (response.success()) {
-    // The follower's hint is the last index its log now agrees with the
-    // leader on, so match/next follow from it instead of from a guess.
-    const u64 matched = response.hint();
-    if (matched > match_indices_[node_idx]) {
-      match_indices_[node_idx] = matched;
+    if (response.type() == MSG_AE_RES) {
+      // The follower's hint is the last index its log now agrees with the
+      // leader on, so match/next follow from it instead of from a guess.
+      const u64 matched = response.hint();
+      if (matched > match_indices_[node_idx]) {
+        match_indices_[node_idx] = matched;
+      }
+      next_indices_[node_idx] = matched + 1;
+      Log("Peer %llu matched through %llu", (ull)node.id, (ull)matched);
     }
-    next_indices_[node_idx] = matched + 1;
-    Log("Peer %llu matched through %llu", (ull)node.id, (ull)matched);
     return MakeSuccess();
   }
 
@@ -935,51 +929,56 @@ auto Raft::HandleAppendEntriesRequest(Request &request) -> Error
     return MakeSuccess();
   }
 
-  // Rules 3 and 4: skip the entries already in the log, then truncate the
-  // first one that conflicts and append everything from there on.
-  u64 index = prev_index;
-  for (int i = 0; i < request.entries_size(); ++i) {
-    Entry const &entry = request.entries(i);
-    ++index;
+  if (request.type() == MSG_AE) {
+    // Rules 3 and 4: skip the entries already in the log, then truncate the
+    // first one that conflicts and append everything from there on.
+    u64 index = prev_index;
+    for (int i = 0; i < request.entries_size(); ++i) {
+      Entry const &entry = request.entries(i);
+      ++index;
 
-    const u64 local_term = log_get_entry_meta_cb_(index);
-    if (local_term != INVALID_TERM && local_term == entry.term()) {
-      continue; // an old entry that is already replicated, keep it
-    }
-
-    if (local_term != INVALID_TERM) {
-      // Rule 3: delete the conflicting entry and everything after it. The
-      // callback keeps the log *through* the given index.
-      // FIXME index?
-      if (!log_truncate_after_cb_(index - 1)) {
-        errcode = E_TRUNCATE;
-        return MakeMsgErrorf("Failed to truncate the log after %llu",
-                             (ull)(index - 1));
+      const u64 local_term = log_get_entry_meta_cb_(index);
+      if (local_term != INVALID_TERM && local_term == entry.term()) {
+        continue; // an old entry that is already replicated, keep it
       }
-    }
 
-    for (int j = i; j < request.entries_size(); ++j) {
-      // The storage layer may take ownership of the entry, hence the
-      // non-const access, but the wire message itself is not modified.
-      Entry &append_entry = *request.mutable_entries(j);
-      if (!log_append_entry_cb_(append_entry)) {
-        errcode = E_LOG_APPEND_ENTRY;
-        return MakeMsgErrorf("Failed to append the log entry at index %llu",
-                             (ull)append_entry.index());
+      if (local_term != INVALID_TERM) {
+        // Rule 3: delete the conflicting entry and everything after it. The
+        // callback keeps the log *through* the given index.
+        // FIXME index?
+        if (!log_truncate_after_cb_(index - 1)) {
+          errcode = E_TRUNCATE;
+          return MakeMsgErrorf("Failed to truncate the log after %llu",
+                              (ull)(index - 1));
+        }
       }
-    }
-    break;
-  }
 
+      for (int j = i; j < request.entries_size(); ++j) {
+        // The storage layer may take ownership of the entry, hence the
+        // non-const access, but the wire message itself is not modified.
+        Entry &append_entry = *request.mutable_entries(j);
+        if (!log_append_entry_cb_(append_entry)) {
+          errcode = E_LOG_APPEND_ENTRY;
+          return MakeMsgErrorf("Failed to append the log entry at index %llu",
+                              (ull)append_entry.index());
+        }
+      }
+      break;
+    }
+  } 
   // Rule 5: advance the commit index, but never past the last index this
   // request proved the leader holds.
-  const u64 last_new_index = prev_index + entries_size;
+  Log("AppendEntries accepted from %llu, prev_index = %llu, entries_size = %llu",
+      (ull)node.id, (ull)prev_index, (ull)entries_size);
+  const u64 last_new_index = request.type() == MSG_AE ? 
+    prev_index + entries_size : 
+    log_get_last_entry_meta_cb_().index;
   SetCommit(KRAFT_MIN(request.commit(), last_new_index));
+  response.set_hint(last_new_index);
 
   // On success the hint is the index the follower's log now agrees with the
   // leader on.
   response.set_success(true);
-  response.set_hint(last_new_index);
   response.set_term(term());
   KRAFT_ASSERT1(send_message_cb_);
   send_message_cb_(&response, node.ctx);
