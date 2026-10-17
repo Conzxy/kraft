@@ -25,7 +25,7 @@ enum ErrorCode {
   E_LOG_APPLY,
   E_ADD_PEER_NODE,
 
-  // RaftLogBufferPool
+  // RaftLogSegmentPool
   E_OPEN_DIR,
   E_READ_DIR,
   E_INVALID_LOG_FILENAME,

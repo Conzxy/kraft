@@ -11,11 +11,11 @@ file(GLOB_RECURSE
   KRAFT_SOURCES
   error_code.cc
   util/*.cc
-  storage/raft_log_buffer.cc
+  storage/raft_log_segment.cc
   storage/file.cc
   storage/dir.cc
-  storage/raft_log_buffer_pool.cc
-  storage/buffer_pool_log.cc
+  storage/raft_log_segment_pool.cc
+  storage/raft_log_manager.cc
   kraft.cc
   raft_driver.cc
   ${3_PARTY_DIR}/kerror/kerror.cc

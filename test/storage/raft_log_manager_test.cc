@@ -1,4 +1,4 @@
-#include "kraft/storage/buffer_pool_log.h"
+#include "kraft/storage/raft_log_manager.h"
 
 #include <gtest/gtest.h>
 
@@ -8,9 +8,9 @@ int N = 100;
 int start_idx = 1;
 int end_idx = N;
 
-BufferPoolLog log_eg;
+RaftLogManager log_eg;
 
-TEST(buffer_pool_log, init)
+TEST(raft_log_manager, init)
 {
   system("rm -rf *.kraftlog");
   auto err = log_eg.Init(".", 10);
@@ -21,7 +21,7 @@ TEST(buffer_pool_log, init)
   }
 }
 
-TEST(buffer_pool_log, append)
+TEST(raft_log_manager, append)
 {
   Entry entry;
   entry.set_type(kraft::ENTRY_NORMAL);
@@ -33,7 +33,7 @@ TEST(buffer_pool_log, append)
   }
 }
 
-TEST(buffer_pool_log, update_state)
+TEST(raft_log_manager, update_state)
 {
   PersistentState state;
   state.set_term(100);
@@ -49,7 +49,7 @@ TEST(buffer_pool_log, update_state)
   ASSERT_EQ(state.voted_for(), state2.voted_for());
 }
 
-TEST(buffer_pool_log, get_last_entry_meta)
+TEST(raft_log_manager, get_last_entry_meta)
 {
   auto meta = log_eg.GetLastEntryMeta();
 
@@ -57,7 +57,7 @@ TEST(buffer_pool_log, get_last_entry_meta)
   ASSERT_EQ(meta.index, end_idx);
 }
 
-TEST(buffer_pool_log, get_entry)
+TEST(raft_log_manager, get_entry)
 {
   log_eg.DebugPrint();
   Entry const *p_entry = nullptr;
@@ -70,7 +70,7 @@ TEST(buffer_pool_log, get_entry)
   }
 }
 
-TEST(buffer_pool_log, get_entry_meta)
+TEST(raft_log_manager, get_entry_meta)
 {
   for (int i = start_idx; i <= end_idx; ++i) {
     auto term = log_eg.GetEntryMeta(i);
@@ -78,7 +78,7 @@ TEST(buffer_pool_log, get_entry_meta)
   }
 }
 
-TEST(buffer_pool_log, truncate_after)
+TEST(raft_log_manager, truncate_after)
 {
   ASSERT_EQ(log_eg.TruncateAfter(45), true);
   auto last_entry_meta = log_eg.GetLastEntryMeta();
@@ -86,16 +86,16 @@ TEST(buffer_pool_log, truncate_after)
   ASSERT_EQ(last_entry_meta.term, 45);
 }
 
-BufferPoolLog log_eg2;
+RaftLogManager log_eg2;
 
-TEST(buffer_pool_log2, init)
+TEST(raft_log_manager2, init)
 {
   end_idx = 45;
   auto err = log_eg2.Init(".", 20);
   ASSERT_FALSE(err) << "Failed to init log engine" << err.info()->GetMessage();
 }
 
-TEST(buffer_pool_log2, get_last_entry_meta_old)
+TEST(raft_log_manager2, get_last_entry_meta_old)
 {
   auto meta = log_eg2.GetLastEntryMeta();
 
@@ -103,7 +103,7 @@ TEST(buffer_pool_log2, get_last_entry_meta_old)
   ASSERT_EQ(meta.index, end_idx);
 }
 
-TEST(buffer_pool_log2, get_entry_meta_old)
+TEST(raft_log_manager2, get_entry_meta_old)
 {
   for (int i = start_idx; i <= end_idx; ++i) {
     auto term = log_eg2.GetEntryMeta(i);
@@ -111,7 +111,7 @@ TEST(buffer_pool_log2, get_entry_meta_old)
   }
 }
 
-TEST(buffer_pool_log2, get_entry_old)
+TEST(raft_log_manager2, get_entry_old)
 {
   Entry const *p_entry = nullptr;
   for (int i = start_idx; i <= end_idx; ++i) {
@@ -123,7 +123,7 @@ TEST(buffer_pool_log2, get_entry_old)
   }
 }
 
-TEST(buffer_pool_log2, append)
+TEST(raft_log_manager2, append)
 {
   start_idx = end_idx + 1;
   end_idx = end_idx + N;
@@ -138,7 +138,7 @@ TEST(buffer_pool_log2, append)
   }
 }
 
-TEST(buffer_pool_log2, get_last_entry_meta)
+TEST(raft_log_manager2, get_last_entry_meta)
 {
   auto meta = log_eg2.GetLastEntryMeta();
 
@@ -146,7 +146,7 @@ TEST(buffer_pool_log2, get_last_entry_meta)
   ASSERT_EQ(meta.index, end_idx);
 }
 
-TEST(buffer_pool_log2, get_entry_meta)
+TEST(raft_log_manager2, get_entry_meta)
 {
   for (int i = 1; i <= end_idx; ++i) {
     auto term = log_eg2.GetEntryMeta(i);
@@ -157,7 +157,7 @@ TEST(buffer_pool_log2, get_entry_meta)
   }
 }
 
-TEST(buffer_pool_log2, get_entry)
+TEST(raft_log_manager2, get_entry)
 {
   Entry const *p_entry = nullptr;
   for (int i = 1; i <= end_idx; ++i) {

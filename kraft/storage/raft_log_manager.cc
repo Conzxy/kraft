@@ -1,9 +1,9 @@
-#include "buffer_pool_log.h"
+// SPDX-LICENSE-IDENTIFIER: BSD-2-Clause
+#include "kraft/storage/raft_log_manager.h"
 
 #include <unistd.h>
 
 #include "kraft/macro.h"
-#include "kraft/storage/buffer_pool_log_impl.h"
 #include "kraft/storage/dir.h"
 #include "kraft/storage/file.h"
 #include "kraft/util.h"
@@ -11,13 +11,14 @@
 
 #include "kraft/error_code.h"
 
+using namespace kraft;
 using namespace kerror;
 
-BufferPoolLog::BufferPoolLog() {}
+RaftLogManager::RaftLogManager() {}
 
-BufferPoolLog::~BufferPoolLog() noexcept {}
+RaftLogManager::~RaftLogManager() noexcept {}
 
-auto BufferPoolLog::Init(char const *dir_name, size_t buffer_capa, size_t n)
+auto RaftLogManager::Init(char const *dir_name, size_t buffer_capa, size_t n)
     -> Error
 {
   buffer_capa_ = buffer_capa;
@@ -60,7 +61,6 @@ auto BufferPoolLog::Init(char const *dir_name, size_t buffer_capa, size_t n)
     if (std::string::npos == log_name.rfind("logging")) {
       // Format:
       // [start_index]-[end_index].kraftlog
-      has_logging_file = true;
       auto separator_pos = log_name.find('-');
       u64 start_index = 0;
       if (std::string::npos == separator_pos) {
@@ -75,20 +75,21 @@ auto BufferPoolLog::Init(char const *dir_name, size_t buffer_capa, size_t n)
         return MakeMsgErrorf("The log is invalid: %s", log_name.c_str());
       }
       idx_path_map_.emplace(
-          start_index,
-          BufferPoolLogImpl::MakePath(this, log_name.c_str(), log_name.size()));
+          start_index, MakePath(log_name.c_str(), log_name.size()));
     } else {
       // Load to memory
       // Format:
       // [start index]-logging.kraftlog
 
-      // FIXME Really?
+      // There must be at most one logging file, and it can appear at any
+      // position in the directory entries, so don't depend on the order.
       if (has_logging_file) continue;
+      has_logging_file = true;
 
-      cur_path_ =
-          BufferPoolLogImpl::MakePath(this, log_name.c_str(), log_name.size());
-      if (!cur_buffer_.Init(cur_path_.c_str(), ReadOnlyFlag::OFF)) {
+      cur_path_ = MakePath(log_name.c_str(), log_name.size());
+      if (auto err = cur_buffer_.Init(cur_path_.c_str(), ReadOnlyFlag::OFF)) {
         errcode = E_OPEN_LOGGING_FILE;
+        return err;
       }
 
       cur_buffer_.SetEntriesNum(buffer_capa_);
@@ -117,7 +118,7 @@ auto BufferPoolLog::Init(char const *dir_name, size_t buffer_capa, size_t n)
     } else {
       auto last_idx_path_iter = --idx_path_map_.end();
       err = cur_buffer_.Init(
-          RaftLogBuffer::MakeLoggingName(last_idx_path_iter->first),
+          RaftLogSegment::MakeLoggingName(last_idx_path_iter->first),
           ReadOnlyFlag::OFF);
     }
 
@@ -127,8 +128,8 @@ auto BufferPoolLog::Init(char const *dir_name, size_t buffer_capa, size_t n)
     cur_buffer_.SetEntriesNum(buffer_capa_);
   }
 
-  const auto meta_path = BufferPoolLogImpl::MakePath(
-      this, KRAFT_META_LOG_NAME, sizeof(KRAFT_META_LOG_NAME) - 1);
+  const auto meta_path =
+      MakePath(KRAFT_META_LOG_NAME, sizeof(KRAFT_META_LOG_NAME) - 1);
 
   int meta_file_mode = File::READ | File::BIN;
 
@@ -150,7 +151,7 @@ auto BufferPoolLog::Init(char const *dir_name, size_t buffer_capa, size_t n)
   return MakeSuccess();
 }
 
-auto BufferPoolLog::AppendEntry(Entry &entry) -> bool
+auto RaftLogManager::AppendEntry(Entry &entry) -> bool
 {
   bool new_buffer = false;
 
@@ -181,7 +182,7 @@ auto BufferPoolLog::AppendEntry(Entry &entry) -> bool
     // The buffer is the latest readonly one,
     // it is likely to be readen by followers
     buffer_pool_.AddBuffer(idx_path_iter->second, cur_buffer_);
-    RaftLogBuffer new_buffer;
+    RaftLogSegment new_buffer;
     new_buffer.Init(new_name, ReadOnlyFlag::OFF);
 
     KRAFT_ASSERT1(new_buffer.GetStartIndex() == old_end_idx + 1);
@@ -191,7 +192,7 @@ auto BufferPoolLog::AppendEntry(Entry &entry) -> bool
   return true;
 }
 
-auto BufferPoolLog::UpdateState(PersistentState const &state) -> bool
+auto RaftLogManager::UpdateState(PersistentState const &state) -> bool
 {
   KRAFT_ASSERT(meta_file_.IsValid(),
                "The file handle of meta data must be valid");
@@ -205,16 +206,16 @@ auto BufferPoolLog::UpdateState(PersistentState const &state) -> bool
   return true;
 }
 
-auto BufferPoolLog::FetchState(PersistentState *state) -> bool
+auto RaftLogManager::FetchState(PersistentState *state) -> bool
 {
   auto ret = state->ParseFromFileDescriptor(meta_file_.GetNativeHandler());
   meta_file_.Rewind();
   return ret;
 }
 
-auto BufferPoolLog::GetLastEntryMeta() -> EntryMeta
+auto RaftLogManager::GetLastEntryMeta() -> EntryMeta
 {
-  RaftLogBuffer *buffer = nullptr;
+  RaftLogSegment *buffer = nullptr;
   if (cur_buffer_.has_logged_num() > 0) {
     buffer = &cur_buffer_;
   } else {
@@ -234,7 +235,7 @@ auto BufferPoolLog::GetLastEntryMeta() -> EntryMeta
   return Entry2Meta(buffer->GetLastEntry());
 }
 
-auto BufferPoolLog::GetEntryMeta(u64 index) -> u64
+auto RaftLogManager::GetEntryMeta(u64 index) -> u64
 {
   Entry const *p_entry = nullptr;
   if (!GetEntry(index, &p_entry)) {
@@ -245,7 +246,7 @@ auto BufferPoolLog::GetEntryMeta(u64 index) -> u64
   return p_entry->term();
 }
 
-auto BufferPoolLog::TruncateAfter(u64 index) -> bool
+auto RaftLogManager::TruncateAfter(u64 index) -> bool
 {
   auto first_buffer_iter = idx_path_map_.upper_bound(index);
   if (idx_path_map_.end() == first_buffer_iter) {
@@ -315,7 +316,7 @@ auto BufferPoolLog::TruncateAfter(u64 index) -> bool
   return true;
 }
 
-auto BufferPoolLog::GetEntry(u64 index, Entry const **entry) -> bool
+auto RaftLogManager::GetEntry(u64 index, Entry const **entry) -> bool
 {
   KRAFT_ASSERT1(entry);
 
@@ -340,13 +341,13 @@ auto BufferPoolLog::GetEntry(u64 index, Entry const **entry) -> bool
   return true;
 }
 
-auto BufferPoolLog::SetBufferCapacity(size_t n) -> void
+auto RaftLogManager::SetBufferCapacity(size_t n) -> void
 {
   buffer_capa_ = n;
   cur_buffer_.SetEntriesNum(n);
 }
 
-auto BufferPoolLog::DebugPrint() -> void
+auto RaftLogManager::DebugPrint() -> void
 {
   printf("The path_idx_map of pool: \n");
   for (auto const &path_idx : buffer_pool_.path_idx_map_) {

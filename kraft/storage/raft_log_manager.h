@@ -1,6 +1,6 @@
 // SPDX-LICENSE-IDENTIFIER: BSD-2-Clause
-#ifndef KRAFT_BUFFER_POOL_LOG_H__
-#define KRAFT_BUFFER_POOL_LOG_H__
+#ifndef KRAFT_RAFT_LOG_MANAGER_H__
+#define KRAFT_RAFT_LOG_MANAGER_H__
 
 #include <cstring>
 #include <map>
@@ -8,17 +8,17 @@
 #include "kraft.pb.h"
 #include "kraft/macro.h"
 #include "kraft/storage/file.h"
-#include "kraft/storage/raft_log_buffer.h"
-#include "kraft/storage/raft_log_buffer_pool.h"
+#include "kraft/storage/raft_log_segment.h"
+#include "kraft/storage/raft_log_segment_pool.h"
 #include "kraft/type.h"
 
 namespace kraft {
 
-class BufferPoolLog {
+class RaftLogManager {
  public:
-  BufferPoolLog();
-  ~BufferPoolLog() noexcept;
-  KRAFT_DISABLE_COPY(BufferPoolLog);
+  RaftLogManager();
+  ~RaftLogManager() noexcept;
+  KRAFT_DISABLE_COPY(RaftLogManager);
 
   // FIXME move op
 
@@ -45,22 +45,30 @@ class BufferPoolLog {
   void DebugPrint();
 
  private:
-  struct BufferPoolLogImpl;
-  friend struct BufferPoolLogImpl;
-  friend class RaftLogBufferPool;
+  KRAFT_INLINE auto MakePath(char const *name, size_t n) const -> std::string
+  {
+    std::string new_path = dir_path_;
+    if (new_path.back() != '/') {
+      new_path += '/';
+    }
+    new_path.append(name, n);
+    return new_path;
+  }
+
+  friend class RaftLogSegmentPool;
 
   std::string dir_path_;
   std::map<u64, std::string> idx_path_map_;
-  RaftLogBufferPool buffer_pool_;
+  RaftLogSegmentPool buffer_pool_;
   size_t buffer_capa_;
 
   std::string cur_path_;
-  RaftLogBuffer cur_buffer_;
+  RaftLogSegment cur_buffer_;
 
   File meta_file_;
 };
 
-using BpLog = BufferPoolLog;
+using BpLog = RaftLogManager;
 
 } // namespace kraft
 
