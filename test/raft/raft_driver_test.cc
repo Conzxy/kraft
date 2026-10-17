@@ -146,6 +146,43 @@ class MemoryLog {
 };
 
 /*--------------------------------------------------*/
+/* A single driven instance                         */
+/*--------------------------------------------------*/
+
+// A ready single-node instance on a manual clock. It has no network, so it is
+// the smallest setup that lets a test poke the driver directly: Tick()'s
+// return value, NextTimeoutMs(), and the callback the driver installs.
+class SingleNode {
+ public:
+  explicit SingleNode(u64 id = 1)
+    : id_(id)
+  {
+    log_.Install(&raft_);
+    // A single-node cluster never sends anything, but IsReady() still requires
+    // the IO callback to be installed.
+    raft_.send_message_cb_ = [](::google::protobuf::Message *, void *) {};
+    raft_.SetClock([this] { return now_ms_; });
+    EXPECT_TRUE(raft_.AddSelfNode(id_, nullptr));
+  }
+
+  KRAFT_DISABLE_COPY(SingleNode);
+  KRAFT_DISABLE_MOVE(SingleNode);
+
+  u64 now_ms() const noexcept { return now_ms_; }
+
+  void Advance(u64 delta_ms) noexcept { now_ms_ += delta_ms; }
+
+  MemoryLog &log() noexcept { return log_; }
+  Raft &raft() noexcept { return raft_; }
+
+ private:
+  u64 id_ = 0;
+  u64 now_ms_ = 1000; // non-zero: 0 means "never contacted" to the instance
+  MemoryLog log_;
+  Raft raft_{0};
+};
+
+/*--------------------------------------------------*/
 /* A cluster of driven instances                    */
 /*--------------------------------------------------*/
 
@@ -413,6 +450,13 @@ RaftDriver::Options FastOptions(u64 id) { return RaftDriver::Options{60, 20, id}
 
 RaftDriver::Options SlowOptions(u64 id) { return RaftDriver::Options{600, 200, id}; }
 
+// A slow-election follower with a fast heartbeat. After a failover it can lead
+// the fast node without letting that node's 60ms election timeout fire first.
+RaftDriver::Options SlowElectionOptions(u64 id)
+{
+  return RaftDriver::Options{600, 20, id};
+}
+
 /*--------------------------------------------------*/
 /* Tests                                            */
 /*--------------------------------------------------*/
@@ -592,6 +636,320 @@ TEST(raft_driver, follower_catches_up_after_a_partition)
   EXPECT_EQ(cluster.At(3).log->applied_indices(), (std::vector<u64>{1, 2, 3}));
   EXPECT_EQ(cluster.At(3).raft->term(), 1u);
   EXPECT_EQ(cluster.LeaderOf()->id, 1u);
+}
+
+TEST(raft_driver, tick_before_the_instance_is_ready_returns_a_full_timeout)
+{
+  // No storage/IO callbacks: the state machine must stay untouched, and Tick()
+  // must not fall through to a 0 that would make a host spin.
+  Raft raft(0);
+  RaftDriver driver(raft, RaftDriver::Options{60, 20, 1});
+
+  EXPECT_EQ(driver.Tick(), 60u);
+  EXPECT_EQ(driver.NextTimeoutMs(), 60u);
+  EXPECT_EQ(raft.term(), 0u);
+  EXPECT_EQ(raft.role(), Raft::RaftRole::FOLLOWER);
+  EXPECT_EQ(raft.commit_index(), 0u);
+  EXPECT_EQ(raft.last_applied(), 0u);
+}
+
+TEST(raft_driver, zero_timeouts_are_clamped_to_one_millisecond)
+{
+  // A zero election timeout would make every Tick() start an election, and a
+  // zero heartbeat interval would make every Tick() send one.
+  Raft raft(0);
+  RaftDriver driver(raft, RaftDriver::Options{0, 0, 1});
+
+  EXPECT_EQ(driver.options().election_timeout_ms, 1u);
+  EXPECT_EQ(driver.options().heartbeat_interval_ms, 1u);
+  EXPECT_EQ(driver.Tick(), 1u);
+}
+
+TEST(raft_driver, seeded_election_timeouts_are_reproducible_and_in_range)
+{
+  // Same seed, same sequence of ticks: the same deadline. This is what makes
+  // the rest of the suite deterministic.
+  SingleNode a(7);
+  SingleNode b(7);
+
+  RaftDriver driver_a(a.raft(), FastOptions(7));
+  RaftDriver driver_b(b.raft(), FastOptions(7));
+
+  const u64 wait_a = driver_a.Tick();
+  const u64 wait_b = driver_b.Tick();
+
+  // The timeout is uniform over [T, 2T).
+  EXPECT_GE(wait_a, 60u);
+  EXPECT_LT(wait_a, 120u);
+  EXPECT_EQ(wait_a, wait_b);
+  EXPECT_EQ(driver_a.NextTimeoutMs(), wait_a);
+  EXPECT_EQ(driver_b.NextTimeoutMs(), wait_b);
+}
+
+TEST(raft_driver, tick_never_returns_zero_and_a_leader_waits_for_its_heartbeat)
+{
+  SingleNode node(1);
+  RaftDriver driver(node.raft(), FastOptions(1));
+
+  const u64 election_wait = driver.Tick();
+  ASSERT_GE(election_wait, 60u);
+  ASSERT_LT(election_wait, 120u);
+
+  node.Advance(election_wait);
+
+  // The election fires exactly at the deadline, and the single node promotes
+  // itself on the spot. Its next deadline is one heartbeat interval away.
+  const u64 heartbeat_wait = driver.Tick();
+  ASSERT_TRUE(node.raft().IsLeader());
+  EXPECT_EQ(heartbeat_wait, 20u);
+  EXPECT_EQ(driver.NextTimeoutMs(), 20u);
+
+  // A tick at the same instant applies what is already committed without
+  // sending an early heartbeat.
+  EXPECT_EQ(driver.Tick(), 20u);
+  EXPECT_EQ(node.raft().commit_index(), 1u);
+  EXPECT_EQ(node.raft().last_applied(), 1u);
+  EXPECT_EQ(node.log().applied_indices(), std::vector<u64>{1});
+}
+
+TEST(raft_driver, callbacks_chain_with_the_host_and_are_restored)
+{
+  SingleNode node(1);
+
+  int host_roles = 0;
+  int host_commits = 0;
+  node.raft().on_role_change_cb_ = [&host_roles](Raft::RaftRole state) {
+    EXPECT_NE(state, Raft::RaftRole::FOLLOWER);
+    ++host_roles;
+  };
+  node.raft().on_commit_index_cb_ = [&host_commits](u64 index) {
+    EXPECT_EQ(index, 1u);
+    ++host_commits;
+  };
+
+  int driver_roles = 0;
+  int driver_commits = 0;
+  {
+    RaftDriver driver(node.raft(), FastOptions(1));
+    driver.OnRoleChange([&driver_roles](Raft::RaftRole state) {
+      EXPECT_NE(state, Raft::RaftRole::FOLLOWER);
+      ++driver_roles;
+    });
+    driver.OnCommit([&driver_commits](u64 index) {
+      EXPECT_EQ(index, 1u);
+      ++driver_commits;
+    });
+
+    const u64 wait = driver.Tick();
+    ASSERT_GE(wait, 60u);
+    ASSERT_LT(wait, 120u);
+
+    node.Advance(wait);
+    driver.Tick(); // candidate, then leader
+    EXPECT_EQ(host_roles, 2);
+    EXPECT_EQ(driver_roles, 2);
+    EXPECT_EQ(host_commits, 0);
+    EXPECT_EQ(driver_commits, 0);
+
+    driver.Tick(); // commit the leader's no-op
+    EXPECT_EQ(host_commits, 1);
+    EXPECT_EQ(driver_commits, 1);
+  }
+
+  // The destructor puts the host callbacks back, so only the host observes the
+  // next notification.
+  const int host_roles_before = host_roles;
+  const int driver_roles_before = driver_roles;
+  node.raft().on_role_change_cb_(Raft::RaftRole::LEADER);
+  EXPECT_EQ(host_roles, host_roles_before + 1);
+  EXPECT_EQ(driver_roles, driver_roles_before);
+
+  const int host_commits_before = host_commits;
+  const int driver_commits_before = driver_commits;
+  node.raft().on_commit_index_cb_(1);
+  EXPECT_EQ(host_commits, host_commits_before + 1);
+  EXPECT_EQ(driver_commits, driver_commits_before);
+}
+
+TEST(raft_driver, replicates_and_applies_a_batch_in_order)
+{
+  TestCluster cluster;
+  cluster.AddNode(1, FastOptions(1));
+  cluster.AddNode(2, SlowOptions(2));
+  cluster.AddNode(3, SlowOptions(3));
+  cluster.ConnectAll();
+  cluster.Run(400);
+
+  ASSERT_NE(cluster.LeaderOf(), nullptr);
+  std::vector<std::string> const values{"one", "two", "three"};
+  for (auto const &value : values) {
+    TestCluster::ExpectOk(
+        cluster.At(1).raft->AppendLog(value.data(), value.size()), "AppendLog");
+  }
+  cluster.Run(100);
+
+  for (u64 id = 1; id <= 3; ++id) {
+    TestCluster::Node &node = cluster.At(id);
+    EXPECT_EQ(node.log->size(), 4u) << "node " << id;
+    for (u64 index = 2; index <= 4; ++index) {
+      EXPECT_EQ(node.log->data_at(index), values[index - 2]) << "node " << id;
+    }
+
+    EXPECT_EQ(node.raft->commit_index(), 4u) << "node " << id;
+    EXPECT_EQ(node.raft->last_applied(), 4u) << "node " << id;
+    EXPECT_EQ(node.log->applied_indices(), (std::vector<u64>{1, 2, 3, 4}))
+        << "node " << id;
+    ASSERT_EQ(node.log->applied().size(), 4u) << "node " << id;
+    for (u64 index = 2; index <= 4; ++index) {
+      EXPECT_EQ(node.log->applied()[index - 1].data(), values[index - 2])
+          << "node " << id;
+    }
+
+    // Commit reports are monotonic, never repeat an index, and reach the tail.
+    ASSERT_FALSE(node.commits.empty()) << "node " << id;
+    EXPECT_EQ(node.commits.front(), 1u) << "node " << id;
+    EXPECT_EQ(node.commits.back(), 4u) << "node " << id;
+    for (size_t i = 1; i < node.commits.size(); ++i) {
+      EXPECT_LT(node.commits[i - 1], node.commits[i]) << "node " << id;
+    }
+  }
+}
+
+TEST(raft_driver, leader_does_not_commit_without_a_reachable_majority)
+{
+  TestCluster cluster;
+  cluster.AddNode(1, FastOptions(1));
+  cluster.AddNode(2, SlowOptions(2));
+  cluster.AddNode(3, SlowOptions(3));
+  cluster.ConnectAll();
+  cluster.Run(400);
+  ASSERT_NE(cluster.LeaderOf(), nullptr);
+
+  // Cut the leader off from both followers. Two nodes are unreachable, so the
+  // entry stays in the leader's log but cannot be committed.
+  cluster.Isolate(2);
+  cluster.Isolate(3);
+  TestCluster::ExpectOk(cluster.At(1).raft->AppendLog("pending", 7),
+                        "AppendLog pending");
+  cluster.Run(100); // far below the followers' 600ms base timeout
+
+  TestCluster::Node &leader = cluster.At(1);
+  EXPECT_EQ(leader.log->size(), 2u);
+  EXPECT_EQ(leader.raft->commit_index(), 1u);
+  EXPECT_EQ(leader.raft->last_applied(), 1u);
+  EXPECT_EQ(leader.log->applied_indices(), std::vector<u64>{1});
+
+  for (u64 id = 2; id <= 3; ++id) {
+    TestCluster::Node &follower = cluster.At(id);
+    EXPECT_EQ(follower.log->size(), 1u) << "node " << id;
+    EXPECT_EQ(follower.raft->commit_index(), 1u) << "node " << id;
+    EXPECT_EQ(follower.raft->term(), 1u) << "node " << id;
+    EXPECT_EQ(follower.raft->role(), Raft::RaftRole::FOLLOWER)
+        << "node " << id;
+  }
+
+  cluster.Heal(2);
+  cluster.Heal(3);
+  cluster.Run(200);
+
+  for (u64 id = 1; id <= 3; ++id) {
+    TestCluster::Node &node = cluster.At(id);
+    EXPECT_EQ(node.log->size(), 2u) << "node " << id;
+    EXPECT_EQ(node.log->data_at(2), "pending") << "node " << id;
+    EXPECT_EQ(node.raft->commit_index(), 2u) << "node " << id;
+    EXPECT_EQ(node.raft->last_applied(), 2u) << "node " << id;
+    EXPECT_EQ(node.log->applied_indices(), (std::vector<u64>{1, 2}))
+        << "node " << id;
+    EXPECT_EQ(node.raft->term(), 1u) << "node " << id;
+  }
+  ASSERT_NE(cluster.LeaderOf(), nullptr);
+  EXPECT_EQ(cluster.LeaderOf()->id, 1u);
+}
+
+TEST(raft_driver, isolated_leader_steps_down_and_truncates_its_conflict)
+{
+  TestCluster cluster;
+  cluster.AddNode(1, FastOptions(1));
+  // The eventual leader's heartbeat must stay below node 1's election timeout,
+  // or node 1 would campaign again as soon as it rejoins and follows it.
+  cluster.AddNode(2, SlowElectionOptions(2));
+  cluster.AddNode(3, SlowElectionOptions(3));
+  cluster.ConnectAll();
+  cluster.Run(400);
+  ASSERT_NE(cluster.LeaderOf(), nullptr);
+
+  // The old leader accepts an entry while it is isolated. It cannot know that
+  // no one else has it, so the entry stays in its log, uncommitted.
+  cluster.Isolate(1);
+  TestCluster::ExpectOk(cluster.At(1).raft->AppendLog("stale", 5),
+                        "AppendLog stale");
+  EXPECT_EQ(cluster.At(1).log->size(), 2u);
+  EXPECT_EQ(cluster.At(1).log->data_at(2), "stale");
+  EXPECT_EQ(cluster.At(1).raft->commit_index(), 1u);
+
+  // The other two nodes are still a majority: they time the old leader out and
+  // elect a new one in a later term.
+  cluster.Run(3000);
+
+  TestCluster::Node *new_leader = nullptr;
+  for (u64 id = 2; id <= 3; ++id) {
+    if (!cluster.At(id).raft->IsLeader()) {
+      continue;
+    }
+    ASSERT_EQ(new_leader, nullptr) << "more than one leader among nodes 2 and 3";
+    new_leader = &cluster.At(id);
+  }
+  ASSERT_NE(new_leader, nullptr) << "nodes 2 and 3 did not elect a leader";
+  EXPECT_GT(new_leader->raft->term(), 1u);
+
+  // The isolated leader still believes it leads term 1; it has not heard the
+  // higher term yet.
+  TestCluster::Node &old_leader = cluster.At(1);
+  ASSERT_TRUE(old_leader.raft->IsLeader());
+  EXPECT_EQ(old_leader.raft->term(), 1u);
+  EXPECT_EQ(old_leader.log->size(), 2u);
+
+  // The new leader appends its own no-op at index 2 and a client entry after
+  // it. Depending on how many elections ran, it may have more than one no-op.
+  const u64 fresh_index = new_leader->log->size() + 1;
+  TestCluster::ExpectOk(new_leader->raft->AppendLog("fresh", 5),
+                        "AppendLog fresh");
+  cluster.Run(100);
+  EXPECT_EQ(new_leader->raft->commit_index(), fresh_index);
+
+  cluster.Heal(1);
+  cluster.Run(300);
+
+  // On the first current-term message the old leader steps down and replaces
+  // the conflicting tail, including its "stale" entry.
+  EXPECT_FALSE(old_leader.raft->IsLeader());
+  EXPECT_EQ(old_leader.raft->term(), new_leader->raft->term());
+  EXPECT_EQ(old_leader.raft->leader_id(), new_leader->id);
+  EXPECT_EQ(old_leader.role_changes.back(), Raft::RaftRole::FOLLOWER);
+
+  EXPECT_EQ(old_leader.log->size(), fresh_index);
+  EXPECT_FALSE(old_leader.log->at(2).has_data());
+  for (u64 index = 2; index < fresh_index; ++index) {
+    EXPECT_FALSE(old_leader.log->at(index).has_data()) << "index " << index;
+  }
+  EXPECT_EQ(old_leader.log->data_at(fresh_index), "fresh");
+  EXPECT_EQ(old_leader.raft->commit_index(), fresh_index);
+  EXPECT_EQ(old_leader.raft->last_applied(), fresh_index);
+
+  std::vector<u64> expected_applied;
+  for (u64 index = 1; index <= fresh_index; ++index) {
+    expected_applied.push_back(index);
+  }
+  EXPECT_EQ(old_leader.log->applied_indices(), expected_applied);
+
+  ASSERT_NE(cluster.LeaderOf(), nullptr);
+  EXPECT_EQ(cluster.LeaderOf()->id, new_leader->id);
+  for (u64 id = 1; id <= 3; ++id) {
+    TestCluster::Node &node = cluster.At(id);
+    EXPECT_EQ(node.log->size(), fresh_index) << "node " << id;
+    EXPECT_EQ(node.log->data_at(fresh_index), "fresh") << "node " << id;
+    EXPECT_EQ(node.raft->commit_index(), fresh_index) << "node " << id;
+  }
 }
 
 TEST(raft_driver, rejects_messages_that_fail_the_whitelist)

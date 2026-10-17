@@ -1024,6 +1024,8 @@ auto Raft::HandleAppendEntriesRequest(Request &request) -> Error
         // Rule 3: delete the conflicting entry and everything after it. The
         // callback keeps the log *through* the given index.
         // FIXME index?
+        Log("Truncate the log after %llu due to a conflict with [%llu] of term %llu",
+          (ull)(index - 1), (ull)entry.index(), (ull)entry.term());
         if (!log_truncate_after_cb_(index - 1)) {
           errcode = E_TRUNCATE;
           return MakeMsgErrorf("Failed to truncate the log after %llu",
@@ -1046,8 +1048,10 @@ auto Raft::HandleAppendEntriesRequest(Request &request) -> Error
   } 
   // Rule 5: advance the commit index, but never past the last index this
   // request proved the leader holds.
-  Log("AppendEntries accepted from %llu, prev_index = %llu, entries_size = %llu",
-      (ull)node.id, (ull)prev_index, (ull)entries_size);
+  if (request.type() == MSG_AE) {
+    Log("AppendEntries accepted from %llu, prev_index = %llu, entries_size = %llu",
+        (ull)node.id, (ull)prev_index, (ull)entries_size);
+  }
   // A heartbeat carries no entries, so the last index it proves is prev_index
   // itself; using the local log's tail instead would let a stale entry beyond
   // prev_index be committed (Raft §5.3).
