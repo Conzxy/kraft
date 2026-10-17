@@ -1,21 +1,20 @@
 // SPDX-LICENSE-IDENTIFIER: BSD-2-Clause
-#include "kraft/storage/raft_log_buffer.h"
+#include "kraft/storage/raft_log_segment.h"
 
 #include <numeric>
 #include <unistd.h>
 
-#include "kraft/storage/raft_log_buffer_impl.h"
 #include "kraft/error_code.h"
 #include "kraft/util/string_util.h"
 
 using namespace kraft;
 using namespace kerror;
 
-RaftLogBuffer::RaftLogBuffer() noexcept {}
+RaftLogSegment::RaftLogSegment() noexcept {}
 
-RaftLogBuffer::~RaftLogBuffer() noexcept {}
+RaftLogSegment::~RaftLogSegment() noexcept {}
 
-RaftLogBuffer::RaftLogBuffer(char const *path, ReadOnlyFlag readonly,
+RaftLogSegment::RaftLogSegment(char const *path, ReadOnlyFlag readonly,
                              Error *error)
 {
   // Even readonly is enable, the mode also contains append
@@ -54,7 +53,7 @@ RaftLogBuffer::RaftLogBuffer(char const *path, ReadOnlyFlag readonly,
   }
 }
 
-auto RaftLogBuffer::FetchEntriesBefore(u64 index) -> Error
+auto RaftLogSegment::FetchEntriesBefore(u64 index) -> Error
 {
   const auto is_logging =
       (file_.filename().rfind("logging") != std::string::npos);
@@ -74,14 +73,14 @@ auto RaftLogBuffer::FetchEntriesBefore(u64 index) -> Error
       kraft::errcode = E_READ_FILE;
       return MakeMsgErrorf(
           "Failed to read the size header of entry index = %llu\n",
-          RaftLogBufferImpl::GetCurrentIndex(this));
+          GetCurrentIndex());
     } else if (ret < sizeof size_header) {
       if (is_logging)
         break;
       else {
         kraft::errcode = E_SIZE_HEADER_INCOMPLTE;
         return MakeMsgErrorf("The read header in %llu is incomplete",
-                             RaftLogBufferImpl::GetCurrentIndex(this));
+                             GetCurrentIndex());
       }
     }
 
@@ -92,11 +91,11 @@ auto RaftLogBuffer::FetchEntriesBefore(u64 index) -> Error
     if (File::INVALID_RETURN == ret) {
       errcode = E_READ_FILE;
       return MakeMsgErrorf("Failed to read the entry of entry index = %llu\n",
-                           RaftLogBufferImpl::GetCurrentIndex(this));
+                           GetCurrentIndex());
     } else if (ret < size_header) {
       errcode = E_ENTRY_INCOMPELTE;
       return MakeMsgErrorf("The entry in %llu is incomplete",
-                           RaftLogBufferImpl::GetCurrentIndex(this));
+                           GetCurrentIndex());
     }
 
     KRAFT_ASSERT1(entry_buf.size() == size_header);
@@ -116,8 +115,15 @@ auto RaftLogBuffer::FetchEntriesBefore(u64 index) -> Error
   return MakeSuccess();
 }
 
-auto RaftLogBuffer::FetchEntries() -> Error
+auto RaftLogSegment::FetchEntries() -> Error
 {
+  // FetchEntries() reloads the entries from the file, so discard the in-memory
+  // entries and read from the beginning of the file. Otherwise, if the file
+  // was just written (e.g. AppendEntry()), the file position is at the end and
+  // no entry can be read.
+  entries_.clear();
+  file_.Rewind();
+
   if (auto err = FetchEntriesBefore(start_index_ + GetCapacitry())) return err;
   const auto capa = entries_.back().index() - start_index_ + 1;
   if (capa != GetCapacitry()) {
@@ -129,7 +135,7 @@ auto RaftLogBuffer::FetchEntries() -> Error
   return MakeSuccess();
 }
 
-auto RaftLogBuffer::AppendEntry(Entry entry, bool *new_buffer) -> Error
+auto RaftLogSegment::AppendEntry(Entry entry, bool *new_buffer) -> Error
 {
 #ifndef NDEBUG
   if (is_readonly_) {
@@ -149,7 +155,7 @@ auto RaftLogBuffer::AppendEntry(Entry entry, bool *new_buffer) -> Error
   if (!entry.SerializeWithCachedSizesToArray(&entry_buf[sizeof size_header])) {
     errcode = E_SERIALIZE_ENTRY;
     return MakeMsgErrorf("Failed to serialize entry [%llu] to %s",
-                         RaftLogBufferImpl::GetCurrentIndex(this),
+                         GetCurrentIndex(),
                          file_.filename().c_str());
   }
 
@@ -165,7 +171,7 @@ auto RaftLogBuffer::AppendEntry(Entry entry, bool *new_buffer) -> Error
   entries_.push_back(std::move(entry));
 
   char new_name[KRAFT_FILE_NAME_LEN];
-  if (RaftLogBufferImpl::IsFull(this)) {
+  if (IsFull()) {
     const ull end_idx = GetEndIndex();
     snprintf(new_name, sizeof new_name, "%llu-%llu.kraftlog",
              (unsigned long long)start_index_, end_idx);
@@ -179,7 +185,7 @@ auto RaftLogBuffer::AppendEntry(Entry entry, bool *new_buffer) -> Error
   return MakeSuccess();
 }
 
-auto RaftLogBuffer::TruncateAfter(u64 index, bool is_remove) -> Error
+auto RaftLogSegment::TruncateAfter(u64 index, bool is_remove) -> Error
 {
   KRAFT_ASSERT(index >= start_index_ - 1 &&
                    index <= start_index_ + has_logged_num() - 1,

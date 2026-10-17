@@ -2,8 +2,8 @@
 #ifndef _KRAFT_STORAGE_RAFT_LOG_BUFFER_H__
 #define _KRAFT_STORAGE_RAFT_LOG_BUFFER_H__
 
-// At first, RaftLogBuffer is a internal class of BufferPoolLog.
-// To maintainess, I split it from BufferPoolLog.
+// At first, RaftLogSegment is a internal class of RaftLogManager.
+// To maintainess, I split it from RaftLogManager.
 
 #include <cstdlib>
 
@@ -19,22 +19,22 @@ namespace kraft {
 using kerror::Error;
 using kerror::ErrorOr;
 
-class BufferPoolLog;
+class RaftLogManager;
 
 DEFINE_BOOLEAN_ENUM_CLASS(ReadOnlyFlag);
 
 /**
- * A buffer contains log entries.
+ * A log segment storage that contains log entries.
  * It can be configed to readonly and read-and-appendonly
  */
-class RaftLogBuffer {
-  friend class BufferPoolLog;
+class RaftLogSegment {
+  friend class RaftLogManager;
 
   using Entries = std::vector<Entry>;
 
  public:
-  RaftLogBuffer() noexcept;
-  ~RaftLogBuffer() noexcept;
+  RaftLogSegment() noexcept;
+  ~RaftLogSegment() noexcept;
 
   /**
    * \brief
@@ -50,29 +50,29 @@ class RaftLogBuffer {
   Error Init(char const *path, ReadOnlyFlag readonly)
   {
     Error err;
-    new (this) RaftLogBuffer(path, readonly, &err);
+    new (this) RaftLogSegment(path, readonly, &err);
     return err;
   }
 
   Error Init(std::string const &path, ReadOnlyFlag readonly)
   {
     Error err;
-    new (this) RaftLogBuffer(path.c_str(), readonly, &err);
+    new (this) RaftLogSegment(path.c_str(), readonly, &err);
     return err;
   }
 
-  static ErrorOr<RaftLogBuffer> Create(char const *path, ReadOnlyFlag readonly)
+  static ErrorOr<RaftLogSegment> Create(char const *path, ReadOnlyFlag readonly)
   {
     Error error;
 
-    RaftLogBuffer ret(path, readonly, &error);
+    RaftLogSegment ret(path, readonly, &error);
     if (error) {
       return error;
     }
     return ret;
   }
 
-  KRAFT_INLINE static ErrorOr<RaftLogBuffer> Create(std::string const &path,
+  KRAFT_INLINE static ErrorOr<RaftLogSegment> Create(std::string const &path,
                                                     ReadOnlyFlag readonly)
   {
     return Create(path.c_str(), readonly);
@@ -96,8 +96,8 @@ class RaftLogBuffer {
   /**
    * Support move to allow buffer can be swapped
    */
-  RaftLogBuffer(RaftLogBuffer &&) noexcept = default;
-  RaftLogBuffer &operator=(RaftLogBuffer &&) noexcept = default;
+  RaftLogSegment(RaftLogSegment &&) noexcept = default;
+  RaftLogSegment &operator=(RaftLogSegment &&) noexcept = default;
 
   // readonly use
   Error FetchEntries();
@@ -189,16 +189,22 @@ class RaftLogBuffer {
   }
 
  private:
-  using Self = RaftLogBuffer;
+  KRAFT_INLINE u64 GetCurrentIndex() const noexcept
+  {
+    return entries_.empty() ? start_index_
+                            : entries_.front().index() + entries_.size() - 1;
+  }
 
-  struct RaftLogBufferImpl;
-  friend struct RaftLogBufferImpl;
+  KRAFT_INLINE bool IsFull() const noexcept
+  {
+    return entries_.size() == GetCapacitry();
+  }
 
   /**
    * \warnign
    *  Please call Init() to initialize the object
    */
-  RaftLogBuffer(char const *path, ReadOnlyFlag readonly, Error *err);
+  RaftLogSegment(char const *path, ReadOnlyFlag readonly, Error *err);
 
   std::vector<Entry> entries_;
   u64 start_index_;

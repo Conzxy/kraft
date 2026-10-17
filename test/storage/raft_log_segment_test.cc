@@ -1,4 +1,4 @@
-#include "kraft/storage/raft_log_buffer.h"
+#include "kraft/storage/raft_log_segment.h"
 
 #include <gtest/gtest.h>
 
@@ -13,9 +13,9 @@ KRAFT_INLINE bool operator==(kraft::Entry const &x,
          x.index() == y.index() && x.data() == y.data();
 }
 
-RaftLogBuffer buffer;
+RaftLogSegment buffer;
 
-TEST(raft_log_buffer, create)
+TEST(raft_log_segment, create)
 {
   auto err = buffer.Init("1-logging.kraftlog", ReadOnlyFlag::OFF);
   ASSERT_EQ(buffer.GetStartIndex() == 1, true);
@@ -37,7 +37,7 @@ TEST(raft_log_buffer, create)
   }
 }
 
-TEST(raft_log_buffer, append)
+TEST(raft_log_segment, append)
 {
   Entry entry;
   bool new_buffer;
@@ -64,7 +64,7 @@ TEST(raft_log_buffer, append)
   printf("log filename = %s\n", buffer.GetFilename().c_str());
 }
 
-TEST(raft_log_buffer, fetch_entries)
+TEST(raft_log_segment, fetch_entries)
 {
   auto err = buffer.FetchEntries();
   ASSERT_FALSE(err) << "Failed to fetch entries\nReason: "
@@ -93,7 +93,7 @@ TEST(raft_log_buffer, fetch_entries)
   }
 }
 
-TEST(raft_log_buffer, truncate)
+TEST(raft_log_segment, truncate)
 {
   ASSERT_FALSE(buffer.FetchEntries());
   ASSERT_FALSE(buffer.TruncateAfter(4, true));
