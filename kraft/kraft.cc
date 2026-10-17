@@ -679,12 +679,12 @@ void Raft::HeartBeatPeriodic()
     auto &node = peer_nodes_[i];
     // FIXME
     if (node.IsRecvHeartBeat()) {
-      node.flag |= NODE_ACTIVE;
+      node.SetActive(true);
     }
     if (err) {
       LogError("Failed to send heartbeat", err);
     }
-    node.flag &= ~NODE_RECV_HEARTBEAT;
+    node.SetRecvHeartBeat(false);
   }
 }
 
@@ -939,6 +939,7 @@ auto Raft::HandleAppendEntriesResponse(Response const &response, u64 node_idx)
     } else if (response.type() == MSG_HEART_BEAT_RES) {
       // Send remaining entries if the follower is behind, otherwise it is a bare
       // heartbeat that only updates the commit index.
+      node.SetRecvHeartBeat(true);
       if (next_indices_[node_idx] <= last_log_index()) {
         auto err = SendAppendEntriesTo(node_idx);
         if (err) {

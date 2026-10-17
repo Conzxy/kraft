@@ -64,6 +64,35 @@ struct Node {
   {
     return flag & NODE_RECV_HEARTBEAT;
   }
+
+  KRAFT_INLINE void SetFlag(NodeFlag f) noexcept { flag |= f; }
+  KRAFT_INLINE void ClearFlag(NodeFlag f) noexcept { flag &= ~f; }
+  KRAFT_INLINE void SetActive(bool active) noexcept
+  {
+    if (active) {
+      SetFlag(NODE_ACTIVE);
+    } else {
+      ClearFlag(NODE_ACTIVE);
+    }
+  }
+
+  KRAFT_INLINE void SetVoting(bool voting) noexcept
+  {
+    if (voting) {
+      SetFlag(NODE_VOTING);
+    } else {
+      ClearFlag(NODE_VOTING);
+    }
+  }
+
+  KRAFT_INLINE void SetRecvHeartBeat(bool recv_heartbeat) noexcept
+  {
+    if (recv_heartbeat) {
+      SetFlag(NODE_RECV_HEARTBEAT);
+    } else {
+      ClearFlag(NODE_RECV_HEARTBEAT);
+    }
+  }
 };
 
 /**
