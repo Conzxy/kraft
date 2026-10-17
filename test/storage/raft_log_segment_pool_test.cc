@@ -1,23 +1,23 @@
-#include "kraft/storage/raft_log_buffer_pool.h"
+#include "kraft/storage/raft_log_segment_pool.h"
 
 #include <gtest/gtest.h>
 
 using namespace kraft;
 using namespace kerror;
 
-RaftLogBufferPool pool;
+RaftLogSegmentPool pool;
 
 std::vector<std::string> lognames;
 
-TEST(raft_log_buffer_pool, main)
+TEST(raft_log_segment_pool, main)
 {
   int logfile_num = 6;
   const int entry_num = 100;
   int start_idx = 1;
 
   for (int i = 0; i < logfile_num; ++i) {
-    RaftLogBuffer buffer;
-    auto err = buffer.Init(RaftLogBuffer::MakeLoggingName(start_idx),
+    RaftLogSegment buffer;
+    auto err = buffer.Init(RaftLogSegment::MakeLoggingName(start_idx),
                            ReadOnlyFlag::OFF);
     buffer.SetEntriesNum(entry_num);
     Entry entry;
@@ -67,7 +67,7 @@ TEST(raft_log_buffer_pool, main)
   }
 }
 
-TEST(raft_log_buffer_pool, victim)
+TEST(raft_log_segment_pool, victim)
 {
   auto start_idx = 501;
   auto entry_num = 100;

@@ -1,15 +1,16 @@
 // SPDX-LICENSE-IDENTIFIER: BSD-2-Clause
-#include "kraft/storage/raft_log_buffer_pool_impl.h"
+#include "kraft/storage/raft_log_segment_pool.h"
 
 #include "kraft/error_code.h"
 
+using namespace kraft;
 using namespace kerror;
 
-RaftLogBufferPool::RaftLogBufferPool() noexcept {}
+RaftLogSegmentPool::RaftLogSegmentPool() noexcept {}
 
-RaftLogBufferPool::~RaftLogBufferPool() noexcept {}
+RaftLogSegmentPool::~RaftLogSegmentPool() noexcept {}
 
-auto RaftLogBufferPool::Init(size_t sz) -> void
+auto RaftLogSegmentPool::Init(size_t sz) -> void
 {
   buffers_.resize(sz);
   for (auto &buffer : buffers_) {
@@ -22,8 +23,8 @@ auto RaftLogBufferPool::Init(size_t sz) -> void
   }
 }
 
-auto RaftLogBufferPool::GetLogBuffer(std::string const &path)
-    -> ErrorOr<RaftLogBuffer *>
+auto RaftLogSegmentPool::GetLogBuffer(std::string const &path)
+    -> ErrorOr<RaftLogSegment *>
 {
   // Construct a dummy value to call emplace()
   // instead of calling find() then calling emplace().
@@ -46,7 +47,7 @@ auto RaftLogBufferPool::GetLogBuffer(std::string const &path)
     }
     new_buffer.iter_ = path_idx_iter;
 
-    u64 index = RaftLogBufferPoolImpl::GetBufferIndex(this, path_idx_iter);
+    u64 index = GetBufferIndex(path_idx_iter);
 
     ret_buffer = &buffers_[index];
     *ret_buffer = std::move(new_buffer);
@@ -59,8 +60,8 @@ auto RaftLogBufferPool::GetLogBuffer(std::string const &path)
   return ret_buffer;
 }
 
-auto RaftLogBufferPool::RemoveBuffer(std::string const &path, u64 index,
-                                     TruncateFlag truncate) -> Error
+auto RaftLogSegmentPool::RemoveBuffer(std::string const &path, u64 index,
+                                      TruncateFlag truncate) -> Error
 {
   auto path_idx_iter = path_idx_map_.find(path.c_str());
   if (!(path_idx_map_.end() == path_idx_iter ||
@@ -85,8 +86,8 @@ auto RaftLogBufferPool::RemoveBuffer(std::string const &path, u64 index,
   return MakeSuccess();
 }
 
-auto RaftLogBufferPool::AddBuffer(std::string const &path,
-                                  RaftLogBuffer &buffer) -> void
+auto RaftLogSegmentPool::AddBuffer(std::string const &path,
+                                   RaftLogSegment &buffer) -> void
 {
   // The path must be not added to this pool
   BufferCtx ctx;
@@ -96,9 +97,9 @@ auto RaftLogBufferPool::AddBuffer(std::string const &path,
   const auto emplace_ret = path_idx_map_.emplace(path.c_str(), std::move(ctx));
   auto path_idx_iter = emplace_ret.first;
 
-  auto index = RaftLogBufferPoolImpl::GetBufferIndex(this, path_idx_iter);
+  auto index = GetBufferIndex(path_idx_iter);
   RaftLogBufferWithIter buffer_iter;
-  (RaftLogBuffer &)buffer_iter = std::move(buffer);
+  (RaftLogSegment &)buffer_iter = std::move(buffer);
   buffer_iter.iter_ = std::move(path_idx_iter);
   buffers_[index] = std::move(buffer_iter);
 }
