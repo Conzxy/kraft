@@ -73,12 +73,17 @@ auto RaftDriver::Tick() -> u64
       raft_.HeartBeatPeriodic();
       next_heartbeat_ms_ = now + options_.heartbeat_interval_ms;
     }
-  } else if (election_armed_ && now >= election_deadline_ms_) {
+  } else if (election_deadline_ms_ && now >= *election_deadline_ms_) {
     raft_.ElectionPeriodic();
-    // Disarm here so that UpdateDeadline() below re-arms a fresh random
-    // deadline. An instance that just won the election counts as a leader by
-    // then and switches to the heartbeat cadence instead.
-    election_armed_ = false;
+    // Consume the deadline before the trailing UpdateDeadline() runs, which
+    // then arms a fresh random one. The state/term change from a real election
+    // would re-arm it anyway; clearing it here also covers an ElectionPeriodic()
+    // that changed nothing. An instance that just won the election is a leader
+    // by then and switches to the heartbeat cadence instead.
+    // 避免ElectionPeriodic()没有改变状态，
+    // 导致下一次Tick()又触发ElectionPeriodic()，
+    // 所以这里清空election_deadline_ms_，让UpdateDeadline()重新设置一个新的election_deadline_ms_
+    election_deadline_ms_.reset();
   }
 
   UpdateDeadline(raft_.NowMs());
@@ -94,12 +99,12 @@ auto RaftDriver::NextTimeoutMs() const noexcept -> u64
     return next_heartbeat_ms_ > now ? next_heartbeat_ms_ - now : 0;
   }
 
-  if (!election_armed_) {
+  if (!election_deadline_ms_) {
     // Not a leader and no deadline yet - one Tick() away from arming.
     return options_.election_timeout_ms;
   }
 
-  return election_deadline_ms_ > now ? election_deadline_ms_ - now : 0;
+  return *election_deadline_ms_ > now ? *election_deadline_ms_ - now : 0;
 }
 
 void RaftDriver::UpdateDeadline(u64 now)
@@ -120,7 +125,7 @@ void RaftDriver::UpdateDeadline(u64 now)
 
   if (role == RaftRole::LEADER) {
     // A leader campaigns for nobody.
-    election_armed_ = false;
+    election_deadline_ms_.reset();
 
     if (entered_leader) {
       // BecomeLeader() already announced itself, so the next heartbeat is one
@@ -135,9 +140,8 @@ void RaftDriver::UpdateDeadline(u64 now)
   // timer - it accepted a current-term AppendEntries/heartbeat, granted a
   // vote, or moved to a new term. Re-arm from now with a fresh random
   // timeout instead of re-deriving those rules from the message stream.
-  if (!election_armed_ || reset_election_deadline) {
+  if (!election_deadline_ms_ || reset_election_deadline) {
     election_deadline_ms_ = now + DrawElectionTimeoutMs();
-    election_armed_ = true;
   }
 }
 

@@ -3,6 +3,7 @@
 #define _KRAFT_RAFT_DRIVER_H__
 
 #include <functional>
+#include <optional>
 #include <random>
 
 #include "kraft/kraft.h"
@@ -117,9 +118,17 @@ class RaftDriver {
    * the peers if this instance is the leader and the heartbeat is due, or
    * starts an election if it is not and the election timeout is due.
    *
-   * \return The number of milliseconds until the next call, as
-   * NextTimeoutMs() would report it. 0 means work is already due and the
-   * host should call again without waiting.
+   * \return The number of milliseconds until the next call: at least 1, so a
+   * host doing `WaitFor(TimerQueue, driver.Tick())` never spins. By the time
+   * the trailing UpdateDeadline() runs, whatever happened above has left a
+   * deadline in the future - a leader one heartbeat interval away, a follower
+   * a fresh randomized election timeout away, and an instance that is not
+   * ready a whole election timeout away. The 0 NextTimeoutMs() can return is
+   * only observable from outside, once a deadline has actually passed.
+   *
+   * \note A host that ignores the return value and polls invokes no more work
+   * than the return value would have scheduled; the value is purely an
+   * optimisation, not a contract on the state machine.
    */
   u64 Tick();
 
@@ -164,11 +173,12 @@ class RaftDriver {
   std::function<void(RaftRole)> prev_on_role_change_;
   std::function<void(u64)> prev_on_commit_;
 
-  // Election timer. Disarmed while this instance is the leader.
-  // 当前节点是leader时，状态是稳定的（role & term），且不需要和leader通信保活，
-  // 需要一个变量来重置选举deadline（尽管也可以通过这个变量直接过滤检测选举超时来开新选举，这里重置主要是为了正确性）
-  bool election_armed_ = false;
-  u64 election_deadline_ms_ = 0;
+  // Election timer. Empty while this instance is the leader: a leader
+  // campaigns for nobody, so it has no election deadline. For a candidate or
+  // follower, UpdateDeadline() arms it with a fresh randomized deadline;
+  // an empty value therefore means "not armed yet", and NextTimeoutMs()
+  // reports that as one whole election timeout away.
+  std::optional<u64> election_deadline_ms_;
 
   u64 next_heartbeat_ms_ = 0;
 
