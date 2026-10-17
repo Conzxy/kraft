@@ -931,11 +931,21 @@ auto Raft::HandleAppendEntriesResponse(Response const &response, u64 node_idx)
       // The follower's hint is the last index its log now agrees with the
       // leader on, so match/next follow from it instead of from a guess.
       const u64 matched = response.hint();
-      if (matched > match_indices_[node_idx]) {
-        match_indices_[node_idx] = matched;
-      }
-      next_indices_[node_idx] = matched + 1;
+      // 避免乱序到达的消息导致match_index回退
+      // HeartBeat也有可能同步日志(见下面)
+      match_indices_[node_idx] = KRAFT_MAX(matched, match_indices_[node_idx]);
+      next_indices_[node_idx] = KRAFT_MAX(next_indices_[node_idx], matched + 1);
       Log("Peer %llu matched through %llu", (ull)node.id, (ull)matched);
+    } else if (response.type() == MSG_HEART_BEAT_RES) {
+      // Send remaining entries if the follower is behind, otherwise it is a bare
+      // heartbeat that only updates the commit index.
+      if (next_indices_[node_idx] <= last_log_index()) {
+        auto err = SendAppendEntriesTo(node_idx);
+        if (err) {
+          LogError("Failed to send AppendEntries to peer", err);
+          return err;
+        }
+      }
     }
     return MakeSuccess();
   }
