@@ -1047,10 +1047,18 @@ auto Raft::HandleAppendEntriesRequest(Request &request) -> Error
   // request proved the leader holds.
   Log("AppendEntries accepted from %llu, prev_index = %llu, entries_size = %llu",
       (ull)node.id, (ull)prev_index, (ull)entries_size);
-  const u64 last_new_index = request.type() == MSG_AE ? 
-    prev_index + entries_size : 
-    log_get_last_entry_meta_cb_().index;
-  SetCommit(KRAFT_MIN(request.commit(), last_new_index));
+  // A heartbeat carries no entries, so the last index it proves is prev_index
+  // itself; using the local log's tail instead would let a stale entry beyond
+  // prev_index be committed (Raft §5.3).
+  const u64 last_new_index = prev_index + entries_size;
+  // commit不能回滚，只能单调递增
+  if (request.commit() > commit_) {
+    // 当日志同步还没跟得上leader和其他大多数节点时，
+    // 不能简单设置commit = request.commit()，否则可能提交了旧日志或者对应日志根本不存在
+    // last_new_index 到 last log index 之间的日志可能是旧的日志，不能提交，因此取
+    // 当前已复制的日志Index（last_new_index < request.commit()）是安全的
+    SetCommit(KRAFT_MIN(request.commit(), last_new_index));
+  }
   response.set_hint(last_new_index);
 
   // On success the hint is the index the follower's log now agrees with the
