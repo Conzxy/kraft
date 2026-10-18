@@ -40,7 +40,7 @@ class RaftLogManager {
   bool GetEntry(u64 index, Entry const **entry);
 
   bool FetchState(PersistentState *state);
-  void SetBufferCapacity(size_t n);
+  void SetSegmentCapacity(size_t n);
 
   void DebugPrint();
 

@@ -6,6 +6,7 @@
 // To maintainess, I split it from RaftLogManager.
 
 #include <cstdlib>
+#include <vector>
 
 #include "kraft.pb.h"
 #include "kraft/macro.h"
@@ -93,6 +94,11 @@ class RaftLogSegment {
     return std::to_string(start_idx) + KRAFT_LOGGING_LOG_NAME_SUFFIX;
   }
 
+  // Upper bound of a serialized entry. It protects the reader from corrupted
+  // size headers turning into huge allocations; real Raft entries are far
+  // smaller than this.
+  static constexpr size_header_t kMaxEntrySize = 64u * 1024 * 1024;
+
   struct LogName {
     u64 start_index = INVALID_INDEX;
     // INVALID_INDEX means this is a logging (appendable) file.
@@ -116,9 +122,20 @@ class RaftLogSegment {
   RaftLogSegment(RaftLogSegment &&) noexcept = default;
   RaftLogSegment &operator=(RaftLogSegment &&) noexcept = default;
 
-  // readonly use
+  /**
+   * \brief Load all entries of a sealed segment.
+   *
+   * These Fetch methods are for readonly (sealed) segments. A logging segment
+   * already owns its entries in memory (recovered by Init(), appended by
+   * AppendEntry()), so they are no-ops for it.
+   */
   Error FetchEntries();
 
+  /**
+   * \brief Load the entries [start_index_, index) of a sealed segment.
+   *
+   * No-op for a logging segment; see FetchEntries().
+   */
   Error FetchEntriesBefore(u64 index);
 
   /**
@@ -218,6 +235,31 @@ class RaftLogSegment {
   }
 
  private:
+  enum class EntryReadResult {
+    kOk,
+    kEof,
+    kError,
+  };
+
+  /**
+   * \brief Read, validate and append one entry.
+   *
+   * \Param expected_index The index the entry must have.
+   * \Param entry_buf Reusable buffer for the serialized entry.
+   * \Param result kEof if the file ended before a complete size header.
+   */
+  Error ReadEntry(u64 expected_index, std::vector<unsigned char> *entry_buf,
+                  EntryReadResult *result);
+
+  /**
+   * \brief Recover the entries already present in an appendable (logging) file.
+   *
+   * Called once from the constructor. The file position is rewound first and
+   * the file is read up to its current size; a trailing incomplete size header
+   * (a torn write) is treated as the end of the valid log.
+   */
+  Error LoadLoggingEntries();
+
   KRAFT_INLINE u64 GetCurrentIndex() const noexcept
   {
     return entries_.empty() ? start_index_

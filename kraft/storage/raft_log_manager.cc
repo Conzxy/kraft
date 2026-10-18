@@ -80,17 +80,13 @@ auto RaftLogManager::Init(char const *dir_name, size_t segment_capa, size_t n)
 
     cur_path_ = path;
     if (auto err = cur_segment_.Init(cur_path_, ReadOnlyFlag::OFF)) {
-      errcode = E_OPEN_LOGGING_FILE;
+      // Keep the specific error from Init()/recovery if it set one.
+      if (E_OK == errcode) errcode = E_OPEN_LOGGING_FILE;
       return err;
     }
 
+    // Init() already recovered the entries appended by a previous run.
     cur_segment_.SetEntriesNum(segment_capa_);
-    if (auto err =
-            cur_segment_.FetchEntriesBefore(cur_segment_.GetStartIndex() + 1))
-    {
-      PErrorSys(err);
-      return err;
-    }
   }
 
 #ifndef NDEBUG
@@ -347,7 +343,7 @@ auto RaftLogManager::GetEntry(u64 index, Entry const **entry) -> bool
   return true;
 }
 
-auto RaftLogManager::SetBufferCapacity(size_t n) -> void
+auto RaftLogManager::SetSegmentCapacity(size_t n) -> void
 {
   segment_capa_ = n;
   cur_segment_.SetEntriesNum(n);
@@ -363,5 +359,5 @@ auto RaftLogManager::DebugPrint() -> void
   printf("The idx_path_map: \n");
   for (auto const &idx_path : idx_path_map_) {
     printf("(%llu -> %s)\n", (ull)idx_path.first, idx_path.second.c_str());
-  }
+  } 
 }

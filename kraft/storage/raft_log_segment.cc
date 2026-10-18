@@ -96,73 +96,212 @@ RaftLogSegment::RaftLogSegment(char const *path, ReadOnlyFlag readonly,
   if (ReadOnlyFlag::ON == readonly) {
     KRAFT_ASSERT1(INVALID_INDEX != log_name.end_index);
     SetEntriesNum(log_name.end_index - log_name.start_index + 1);
+  } else if (INVALID_INDEX == log_name.end_index) {
+    // A logging segment is appendable and its entries live in memory. Recover
+    // the entries appended by a previous run as part of initialization; the
+    // Fetch methods are no-ops for logging segments.
+    Error load_error = LoadLoggingEntries();
+    if (load_error) {
+      *error = std::move(load_error);
+      return;
+    }
   }
+}
+
+auto RaftLogSegment::ReadEntry(u64 expected_index,
+                               std::vector<unsigned char> *entry_buf,
+                               EntryReadResult *result) -> Error
+{
+  KRAFT_ASSERT1(entry_buf);
+  KRAFT_ASSERT1(result);
+
+  *result = EntryReadResult::kError;
+
+  size_header_t size_header = 0;
+  auto ret = file_.Read(&size_header, sizeof size_header);
+  if (File::INVALID_RETURN == ret) {
+    errcode = E_READ_FILE;
+    return MakeMsgErrorf(
+        "Failed to read the size header of entry index %llu in %s",
+        (ull)expected_index, file_.filename().c_str());
+  }
+
+  if (ret < sizeof size_header) {
+    *result = EntryReadResult::kEof;
+    return MakeSuccess();
+  }
+
+  if (0 == size_header) {
+    errcode = E_INVALID_LOG_ENTRY;
+    return MakeMsgErrorf(
+        "The size header of entry index %llu is zero in %s",
+        (ull)expected_index, file_.filename().c_str());
+  }
+
+  if (size_header > kMaxEntrySize) {
+    errcode = E_ENTRY_TOO_LARGE;
+    return MakeMsgErrorf(
+        "The size header (%u) of entry index %llu is too large in %s",
+        size_header, (ull)expected_index, file_.filename().c_str());
+  }
+
+  entry_buf->resize(size_header);
+  ret = file_.Read(entry_buf->data(), size_header);
+  if (File::INVALID_RETURN == ret) {
+    errcode = E_READ_FILE;
+    return MakeMsgErrorf(
+        "Failed to read the entry of entry index %llu in %s",
+        (ull)expected_index, file_.filename().c_str());
+  }
+
+  if (ret < size_header) {
+    errcode = E_ENTRY_INCOMPELTE;
+    return MakeMsgErrorf("The entry %llu is incomplete in %s",
+                         (ull)expected_index, file_.filename().c_str());
+  }
+
+  KRAFT_ASSERT1(entry_buf->size() == size_header);
+
+  // Parse and verify the entry index.
+  entries_.emplace_back();
+  auto &new_entry = entries_.back();
+  if (!new_entry.ParseFromArray(entry_buf->data(),
+                                static_cast<int>(entry_buf->size())) ||
+      !new_entry.IsInitialized())
+  {
+    entries_.pop_back();
+    errcode = E_INVALID_LOG_ENTRY;
+    return MakeMsgErrorf(
+        "Failed to parse entry index %llu (size = %u) in %s",
+        (ull)expected_index, size_header, file_.filename().c_str());
+  }
+
+  if (new_entry.index() != expected_index) {
+    const auto actual_index = new_entry.index();
+    entries_.pop_back();
+    errcode = E_INVALID_LOG_ENTRY;
+    return MakeMsgErrorf(
+        "The entry index %llu is incorrect, it should be %llu in %s",
+        (ull)actual_index, (ull)expected_index, file_.filename().c_str());
+  }
+
+  *result = EntryReadResult::kOk;
+  return MakeSuccess();
 }
 
 auto RaftLogSegment::FetchEntriesBefore(u64 index) -> Error
 {
-  const auto is_logging =
-      (file_.filename().rfind("logging") != std::string::npos);
+  LogName log_name;
+  const auto has_valid_name = ParseLogName(file_.filename(), &log_name);
+  KRAFT_ASSERT1(has_valid_name);
+
+  // A logging segment owns its entries in memory; nothing to fetch.
+  if (has_valid_name && INVALID_INDEX == log_name.end_index) {
+    return MakeSuccess();
+  }
+
+  // Sealed segments know their end index, so this must read an exact number of
+  // records and must not probe EOF.
+  KRAFT_ASSERT1(has_valid_name && INVALID_INDEX != log_name.end_index);
 
   KRAFT_ASSERT1(index > start_index_ && index <= start_index_ + GetCapacitry());
   const auto num = index - start_index_;
 
-  size_header_t size_header = 0;
   std::vector<unsigned char> entry_buf;
+  for (u64 i = 0; i < num; ++i) {
+    const auto expected_index = start_index_ + i;
+    EntryReadResult result;
+    if (auto err = ReadEntry(expected_index, &entry_buf, &result)) {
+      return err;
+    }
 
-  Entry entry;
-
-  for (;;) {
-    // TODO Caching
-    auto ret = file_.Read(&size_header, sizeof size_header);
-    if (File::INVALID_RETURN == ret) {
-      kraft::errcode = E_READ_FILE;
+    if (EntryReadResult::kEof == result) {
+      errcode = E_SIZE_HEADER_INCOMPLTE;
       return MakeMsgErrorf(
-          "Failed to read the size header of entry index = %llu\n",
-          GetCurrentIndex());
-    } else if (ret < sizeof size_header) {
-      if (is_logging)
-        break;
-      else {
-        kraft::errcode = E_SIZE_HEADER_INCOMPLTE;
-        return MakeMsgErrorf("The read header in %llu is incomplete",
-                             GetCurrentIndex());
-      }
+          "The sealed log file %s ended before entry index %llu",
+          file_.filename().c_str(), (ull)expected_index);
     }
 
-    KRAFT_ASSERT1(size_header != 0 && size_header != (u32)-1);
+    if (EntryReadResult::kOk != result) {
+      errcode = E_INVALID_LOG_ENTRY;
+      return MakeMsgErrorf("Failed to read entry index %llu in %s",
+                           (ull)expected_index, file_.filename().c_str());
+    }
+  }
 
-    entry_buf.resize(size_header);
-    ret = file_.Read(&entry_buf[0], size_header);
-    if (File::INVALID_RETURN == ret) {
+  return MakeSuccess();
+}
+
+auto RaftLogSegment::LoadLoggingEntries() -> Error
+{
+  LogName log_name;
+  const auto has_valid_name = ParseLogName(file_.filename(), &log_name);
+  KRAFT_ASSERT1(has_valid_name);
+  KRAFT_ASSERT1(has_valid_name && INVALID_INDEX == log_name.end_index);
+
+  entries_.clear();
+  file_.Rewind();
+
+  const auto file_size = file_.GetFileSize();
+  if (File::INVALID_RETURN == file_size) {
+    errcode = E_READ_FILE;
+    return MakeMsgErrorf("Failed to get the size of %s",
+                         file_.filename().c_str());
+  }
+
+  std::vector<unsigned char> entry_buf;
+  for (;;) {
+    const auto position = file_.GetCurrentPosition();
+    if (position < 0) {
       errcode = E_READ_FILE;
-      return MakeMsgErrorf("Failed to read the entry of entry index = %llu\n",
-                           GetCurrentIndex());
-    } else if (ret < size_header) {
-      errcode = E_ENTRY_INCOMPELTE;
-      return MakeMsgErrorf("The entry in %llu is incomplete",
-                           GetCurrentIndex());
+      return MakeMsgErrorf("Failed to get the position of %s",
+                           file_.filename().c_str());
     }
 
-    KRAFT_ASSERT1(entry_buf.size() == size_header);
-    entries_.emplace_back();
-    entries_.back().ParseFromArray(entry_buf.data(), entry_buf.size());
-    if (entries_.size() == num && !is_logging) break;
+    const auto offset = static_cast<size_t>(position);
+    if (offset == file_size) {
+      break;
+    }
+
+    // A torn write may leave a partial size header at the tail. Everything
+    // from here on is uncommitted; stop at the last complete entry.
+    // 在Read之前检测header是否不完整，可以让文件指针停在最后一个完整的entry之后，
+    // 避免Read时返回Eof丢失边界，方便直接truncate掉不完整的entry
+    if (offset + sizeof(size_header_t) > file_size) {
+      break;
+    }
+
+    const auto expected_index = start_index_ + entries_.size();
+    EntryReadResult result;
+    if (auto err = ReadEntry(expected_index, &entry_buf, &result)) {
+      return err;
+    }
+
+    if (EntryReadResult::kEof == result) {
+      break;
+    }
+
+    if (EntryReadResult::kOk != result) {
+      errcode = E_INVALID_LOG_ENTRY;
+      return MakeMsgErrorf("Failed to read entry index %llu in %s",
+                           (ull)expected_index, file_.filename().c_str());
+    }
   }
 
-  KRAFT_ASSERT1(entries_.front().index() == start_index_);
-
-  if (entries_.back().index() != GetEndIndex()) {
-    errcode = E_INVALID_LOG_ENTRY;
-    return MakeMsgErrorf(
-        "The last entry index: %zu is incorrect, it should be %zu",
-        entries_.back().index(), GetEndIndex());
-  }
   return MakeSuccess();
 }
 
 auto RaftLogSegment::FetchEntries() -> Error
 {
+  LogName log_name;
+  const auto has_valid_name = ParseLogName(file_.filename(), &log_name);
+  KRAFT_ASSERT1(has_valid_name);
+
+  // A logging segment owns its entries in memory; nothing to fetch.
+  if (has_valid_name && INVALID_INDEX == log_name.end_index) {
+    return MakeSuccess();
+  }
+
   // FetchEntries() reloads the entries from the file, so discard the in-memory
   // entries and read from the beginning of the file. Otherwise, if the file
   // was just written (e.g. AppendEntry()), the file position is at the end and
@@ -171,6 +310,13 @@ auto RaftLogSegment::FetchEntries() -> Error
   file_.Rewind();
 
   if (auto err = FetchEntriesBefore(start_index_ + GetCapacitry())) return err;
+
+  if (entries_.empty()) {
+    errcode = E_INVALID_LOG_CONTENT;
+    return MakeMsgErrorf("The log file contains no entries: %s",
+                         file_.filename().c_str());
+  }
+
   const auto capa = entries_.back().index() - start_index_ + 1;
   if (capa != GetCapacitry()) {
     errcode = E_INVALID_LOG_CONTENT;
