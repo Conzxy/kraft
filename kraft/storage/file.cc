@@ -214,4 +214,10 @@ size_t File::GetFileSize() const noexcept
   return fsize;
 }
 
-bool File::Fsync() noexcept { return 0 == fsync(fileno(fp_)); }
+bool File::Fsync() noexcept
+{
+  // File::Write() goes through stdio, so its buffer must reach the fd before
+  // fsync(). Otherwise fsync() can succeed while the data is still in the
+  // stdio buffer.
+  return 0 == ::fflush(fp_) && 0 == ::fsync(fileno(fp_));
+}
