@@ -14,8 +14,59 @@ RaftLogSegment::RaftLogSegment() noexcept {}
 
 RaftLogSegment::~RaftLogSegment() noexcept {}
 
+auto RaftLogSegment::ParseLogName(std::string const &path, LogName *name) -> bool
+{
+  KRAFT_ASSERT1(name);
+
+  const auto filename = GetFilenameWithoutDir(path);
+  const auto separator_pos = filename.find('-');
+  // A u64 index has at most 20 decimal digits.
+  if (0 == separator_pos || std::string::npos == separator_pos ||
+      separator_pos > 20)
+  {
+    return false;
+  }
+
+  u64 start_index = 0;
+  if (!Raw2U64(filename.data(), separator_pos, &start_index) ||
+      INVALID_INDEX == start_index)
+  {
+    return false;
+  }
+
+  const auto extension_pos = filename.find('.', separator_pos + 1);
+  if (std::string::npos == extension_pos ||
+      filename.compare(extension_pos, std::string::npos,
+                       KRAFT_ENTRY_LOG_EXT) != 0)
+  {
+    return false;
+  }
+
+  name->start_index = start_index;
+
+  const auto index_part =
+      filename.substr(separator_pos + 1, extension_pos - separator_pos - 1);
+  if (index_part.empty() || index_part.size() > 20) {
+    return false;
+  }
+
+  if ("logging" == index_part) {
+    name->end_index = INVALID_INDEX;
+    return true;
+  }
+
+  u64 end_index = 0;
+  if (!Raw2U64(index_part.data(), index_part.size(), &end_index) ||
+      INVALID_INDEX == end_index || end_index < start_index)
+  {
+    return false;
+  }
+  name->end_index = end_index;
+  return true;
+}
+
 RaftLogSegment::RaftLogSegment(char const *path, ReadOnlyFlag readonly,
-                             Error *error)
+                               Error *error)
 {
   // Even readonly is enable, the mode also contains append
   // since truncate may need swap the buffer to current buffer
@@ -34,22 +85,17 @@ RaftLogSegment::RaftLogSegment(char const *path, ReadOnlyFlag readonly,
     return;
   }
 
-  auto file_path = GetFilenameWithoutDir(file_.filename());
-  const auto separator_pos = file_path.find('-');
-  KRAFT_ASSERT(std::string::npos != separator_pos,
-               "The log filename is invalid, generation logic has error");
-  u64 start_index = -1;
-  auto ok = Raw2U64(file_path.data(), separator_pos, &start_index);
-  KRAFT_UNUSED(ok);
-  KRAFT_ASSERT(ok, "The start index is invalid");
-  SetStartIndex(start_index);
-  const auto extension_pos = file_path.find('.', separator_pos + 1);
+  LogName log_name;
+  if (!ParseLogName(file_.filename(), &log_name)) {
+    *error = MakeMsgErrorf("The log filename is invalid: %s", path);
+    kraft::errcode = E_INVALID_LOG_FILENAME;
+    return;
+  }
+
+  SetStartIndex(log_name.start_index);
   if (ReadOnlyFlag::ON == readonly) {
-    u64 end_index;
-    ok = Raw2U64(file_path.data() + separator_pos + 1,
-                 extension_pos - separator_pos - 1, &end_index);
-    KRAFT_ASSERT(ok, "The end index is invalid");
-    SetEntriesNum(end_index - start_index + 1);
+    KRAFT_ASSERT1(INVALID_INDEX != log_name.end_index);
+    SetEntriesNum(log_name.end_index - log_name.start_index + 1);
   }
 }
 
@@ -170,15 +216,17 @@ auto RaftLogSegment::AppendEntry(Entry entry, bool *new_buffer) -> Error
 
   entries_.push_back(std::move(entry));
 
-  char new_name[KRAFT_FILE_NAME_LEN];
   if (IsFull()) {
-    const ull end_idx = GetEndIndex();
-    snprintf(new_name, sizeof new_name, "%llu-%llu.kraftlog",
-             (unsigned long long)start_index_, end_idx);
-    if (!file_.Rename(new_name)) {
+    char name_we[KRAFT_FILE_NAME_LEN];
+    snprintf(name_we, sizeof name_we, "%llu-%llu",
+             (unsigned long long)start_index_,
+             (unsigned long long)GetEndIndex());
+    // Rename in the same directory as the logging file, not in the CWD.
+    const auto new_name = MakeSiblingPath(MakeLogName(name_we));
+    if (!file_.Rename(new_name.c_str())) {
       errcode = E_RENAME_FULL_LOG_FILE;
       return MakeMsgErrorf("Failed to rename the logging file '%s' to '%s'",
-                           file_.filename().c_str(), new_name);
+                           file_.filename().c_str(), new_name.c_str());
     }
     *new_buffer = true;
   }

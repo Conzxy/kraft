@@ -93,6 +93,23 @@ class RaftLogSegment {
     return std::to_string(start_idx) + KRAFT_LOGGING_LOG_NAME_SUFFIX;
   }
 
+  struct LogName {
+    u64 start_index = INVALID_INDEX;
+    // INVALID_INDEX means this is a logging (appendable) file.
+    u64 end_index = INVALID_INDEX;
+  };
+
+  /**
+   * \brief Parse a log filename.
+   *
+   * Formats:
+   *  [start_index]-[end_index].kraftlog   (sealed segment)
+   *  [start_index]-logging.kraftlog       (appendable segment)
+   *
+   * \return false if the filename is not a valid kraft log name.
+   */
+  static bool ParseLogName(std::string const &path, LogName *name);
+
   /**
    * Support move to allow buffer can be swapped
    */
@@ -103,6 +120,7 @@ class RaftLogSegment {
   Error FetchEntries();
 
   Error FetchEntriesBefore(u64 index);
+
   /**
    * \brief
    *
@@ -129,9 +147,21 @@ class RaftLogSegment {
     return TruncateAfter(start_index_ - 1, is_remove);
   }
 
-  // Don't use reserve()
-  // If the capacity is over the argument, the capacity() may don't changed.
-  KRAFT_INLINE void SetEntriesNum(size_t n) { entries_.reserve(n); }
+  /**
+   * \brief Set the maximum number of entries this segment can hold.
+   *
+   * For a readonly segment it is also the expected entry count derived from
+   * the [start]-[end] filename.
+   *
+   * NOTE: This must not be implemented with std::vector::capacity(): reserve()
+   * only guarantees capacity() >= n, so capacity() is not a reliable entry
+   * count and would make IsFull()/FetchEntries() misbehave.
+   */
+  KRAFT_INLINE void SetEntriesNum(size_t n)
+  {
+    max_entries_ = n;
+    entries_.reserve(n);
+  }
 
   KRAFT_INLINE void SetStartIndex(u64 idx) noexcept { start_index_ = idx; }
 
@@ -139,10 +169,7 @@ class RaftLogSegment {
   /* Attributes getter                                */
   /*--------------------------------------------------*/
 
-  KRAFT_INLINE size_t GetCapacitry() const noexcept
-  {
-    return entries_.capacity();
-  }
+  KRAFT_INLINE size_t GetCapacitry() const noexcept { return max_entries_; }
   KRAFT_INLINE u64 has_logged_num() const noexcept { return entries_.size(); }
   KRAFT_INLINE u64 GetStartIndex() const noexcept { return start_index_; }
   KRAFT_INLINE u64 GetEndIndex() const noexcept
@@ -184,7 +211,9 @@ class RaftLogSegment {
 
   KRAFT_INLINE bool RenameToLogging() noexcept
   {
-    const auto new_name = MakeLoggingName(start_index_);
+    // Rename in the same directory as the current file. Never rely on the
+    // process working directory.
+    const auto new_name = MakeSiblingPath(MakeLoggingName(start_index_));
     return file_.Rename(new_name.c_str());
   }
 
@@ -197,7 +226,20 @@ class RaftLogSegment {
 
   KRAFT_INLINE bool IsFull() const noexcept
   {
-    return entries_.size() == GetCapacitry();
+    return max_entries_ > 0 && entries_.size() >= max_entries_;
+  }
+
+  /**
+   * \brief Make a path in the directory of the current log file.
+   */
+  KRAFT_INLINE std::string MakeSiblingPath(std::string const &name) const
+  {
+    const auto &self = file_.filename();
+    const auto separator_pos = self.rfind('/');
+    if (std::string::npos == separator_pos) {
+      return name;
+    }
+    return self.substr(0, separator_pos + 1) + name;
   }
 
   /**
@@ -207,6 +249,8 @@ class RaftLogSegment {
   RaftLogSegment(char const *path, ReadOnlyFlag readonly, Error *err);
 
   std::vector<Entry> entries_;
+  // The maximum (or expected) number of entries, NOT entries_.capacity().
+  size_t max_entries_ = 0;
   u64 start_index_;
   FileWithMeta file_;
 
