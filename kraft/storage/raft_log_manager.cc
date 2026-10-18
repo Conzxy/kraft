@@ -355,9 +355,9 @@ auto RaftLogManager::SetBufferCapacity(size_t n) -> void
 
 auto RaftLogManager::DebugPrint() -> void
 {
-  printf("The path_idx_map of pool: \n");
-  for (auto const &path_idx : segment_pool_.path_idx_map_) {
-    printf("(%s -> %llu)\n", path_idx.first, (ull)path_idx.second.idx);
+  printf("The segment pool cache: \n");
+  for (auto const &path_idx : segment_pool_.path_to_index_) {
+    printf("(%s -> %llu)\n", path_idx.first.c_str(), (ull)path_idx.second);
   }
 
   printf("The idx_path_map: \n");
