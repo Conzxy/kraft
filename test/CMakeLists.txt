@@ -51,6 +51,8 @@ endmacro()
 
 find_package(GTest CONFIG REQUIRED)
 find_package(benchmark CONFIG REQUIRED)
+# Imported targets are directory-scoped, so the tests need their own lookup.
+find_package(Protobuf REQUIRED CONFIG)
 
 #set(TEST_LIBS kraft kraft_protobuf)
 #set(BENCH_LIBS kraft kraft_protobuf)

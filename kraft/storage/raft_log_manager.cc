@@ -7,7 +7,6 @@
 #include "kraft/storage/dir.h"
 #include "kraft/storage/file.h"
 #include "kraft/util.h"
-#include "kraft/util/string_util.h"
 
 #include "kraft/error_code.h"
 
@@ -18,15 +17,15 @@ RaftLogManager::RaftLogManager() {}
 
 RaftLogManager::~RaftLogManager() noexcept {}
 
-auto RaftLogManager::Init(char const *dir_name, size_t buffer_capa, size_t n)
+auto RaftLogManager::Init(char const *dir_name, size_t segment_capa, size_t n)
     -> Error
 {
-  buffer_capa_ = buffer_capa;
+  segment_capa_ = segment_capa;
 
   Dir dir;
   dir_path_ = dir_name;
 
-  if (dir_path_.back() != '/') {
+  if (dir_path_.empty() || dir_path_.back() != '/') {
     dir_path_ += '/';
   }
 
@@ -36,13 +35,16 @@ auto RaftLogManager::Init(char const *dir_name, size_t buffer_capa, size_t n)
   }
 
   std::vector<std::string> log_names;
-  if (!dir.ApplyDirEntries([&log_names](DirEntry const *entry) {
-        // Get the filename without dir prefix at first.
-        std::string log_name = entry->d_name;
-        if (DT_REG == entry->d_type &&
-            std::string::npos != log_name.rfind(KRAFT_ENTRY_LOG_EXT))
+  if (!dir.ApplyDirEntries([&log_names](DirEntry const &entry) {
+        if (!entry.IsRegularFile()) return;
+
+        std::string log_name = entry.name();
+        const std::string ext = KRAFT_ENTRY_LOG_EXT;
+        if (log_name.size() > ext.size() &&
+            log_name.compare(log_name.size() - ext.size(), ext.size(), ext) ==
+                0)
         {
-          log_names.emplace_back(entry->d_name);
+          log_names.emplace_back(std::move(log_name));
         }
       }))
   {
@@ -51,54 +53,43 @@ auto RaftLogManager::Init(char const *dir_name, size_t buffer_capa, size_t n)
   }
 
   bool has_logging_file = false;
-  // Parse the filename to
-  // validate whether the file is a valid log of kraft
+  // Parse the filenames to restore the index. A logging file can appear at any
+  // position in the directory entries, so don't depend on the order.
   for (auto &log_name : log_names) {
 #ifndef NDEBUG
     printf("logname = %s\n", log_name.c_str());
 #endif
-    // Readonly log file
-    if (std::string::npos == log_name.rfind("logging")) {
-      // Format:
-      // [start_index]-[end_index].kraftlog
-      auto separator_pos = log_name.find('-');
-      u64 start_index = 0;
-      if (std::string::npos == separator_pos) {
-        errcode = E_INVALID_LOG_FILENAME;
-        return MakeMsgErrorf("The log is invalid: %s", log_name.c_str());
-      }
+    const auto path = MakeFullPath(log_name);
 
-      if (!Raw2U64(log_name.data(), separator_pos, &start_index) ||
-          ULLONG_MAX == start_index)
-      {
-        errcode = E_INVALID_LOG_FILENAME;
-        return MakeMsgErrorf("The log is invalid: %s", log_name.c_str());
-      }
-      idx_path_map_.emplace(
-          start_index, MakePath(log_name.c_str(), log_name.size()));
-    } else {
-      // Load to memory
-      // Format:
-      // [start index]-logging.kraftlog
+    RaftLogSegment::LogName log_info;
+    if (!RaftLogSegment::ParseLogName(path, &log_info)) {
+      errcode = E_INVALID_LOG_FILENAME;
+      return MakeMsgErrorf("The log is invalid: %s", log_name.c_str());
+    }
 
-      // There must be at most one logging file, and it can appear at any
-      // position in the directory entries, so don't depend on the order.
-      if (has_logging_file) continue;
-      has_logging_file = true;
+    if (INVALID_INDEX != log_info.end_index) {
+      // Sealed segment: [start_index]-[end_index].kraftlog
+      idx_path_map_.emplace(log_info.start_index, path);
+      continue;
+    }
 
-      cur_path_ = MakePath(log_name.c_str(), log_name.size());
-      if (auto err = cur_buffer_.Init(cur_path_.c_str(), ReadOnlyFlag::OFF)) {
-        errcode = E_OPEN_LOGGING_FILE;
-        return err;
-      }
+    // Logging segment: [start_index]-logging.kraftlog
+    // There must be at most one, ignore the rest defensively.
+    if (has_logging_file) continue;
+    has_logging_file = true;
 
-      cur_buffer_.SetEntriesNum(buffer_capa_);
-      if (auto err =
-              cur_buffer_.FetchEntriesBefore(cur_buffer_.GetStartIndex() + 1))
-      {
-        PErrorSys(err);
-        return err;
-      }
+    cur_path_ = path;
+    if (auto err = cur_segment_.Init(cur_path_, ReadOnlyFlag::OFF)) {
+      errcode = E_OPEN_LOGGING_FILE;
+      return err;
+    }
+
+    cur_segment_.SetEntriesNum(segment_capa_);
+    if (auto err =
+            cur_segment_.FetchEntriesBefore(cur_segment_.GetStartIndex() + 1))
+    {
+      PErrorSys(err);
+      return err;
     }
   }
 
@@ -108,28 +99,37 @@ auto RaftLogManager::Init(char const *dir_name, size_t buffer_capa, size_t n)
     printf("(%llu -> %s)\n", (ull)idx_path.first, idx_path.second.c_str());
   }
 #endif
-  // If there is no logging file or no log file,
-  // consider init a current buffer
+  // If there is no logging file, create a new one. The new segment must start
+  // right after the last sealed segment ([start]-[end]), not at its start
+  // index; the latter would overlap with the sealed data.
   if (!has_logging_file) {
     Error err;
-    if (idx_path_map_.empty()) {
-      err = cur_buffer_.Init("1" KRAFT_LOGGING_LOG_NAME_SUFFIX,
-                             ReadOnlyFlag::OFF);
-    } else {
+    u64 logging_start = 1;
+    if (!idx_path_map_.empty()) {
       auto last_idx_path_iter = --idx_path_map_.end();
-      err = cur_buffer_.Init(
-          RaftLogSegment::MakeLoggingName(last_idx_path_iter->first),
-          ReadOnlyFlag::OFF);
+      RaftLogSegment::LogName last_log_name;
+      if (!RaftLogSegment::ParseLogName(last_idx_path_iter->second,
+                                        &last_log_name) ||
+          INVALID_INDEX == last_log_name.end_index)
+      {
+        errcode = E_INVALID_LOG_FILENAME;
+        return MakeMsgErrorf("The log filename is invalid: %s",
+                             last_idx_path_iter->second.c_str());
+      }
+      logging_start = last_log_name.end_index + 1;
     }
 
+    const auto logging_path =
+        MakeFullPath(RaftLogSegment::MakeLoggingName(logging_start));
+    err = cur_segment_.Init(logging_path, ReadOnlyFlag::OFF);
     if (err) {
       return err;
     }
-    cur_buffer_.SetEntriesNum(buffer_capa_);
+    cur_segment_.SetEntriesNum(segment_capa_);
   }
 
   const auto meta_path =
-      MakePath(KRAFT_META_LOG_NAME, sizeof(KRAFT_META_LOG_NAME) - 1);
+      MakeFullPath(KRAFT_META_LOG_NAME, sizeof(KRAFT_META_LOG_NAME) - 1);
 
   int meta_file_mode = File::READ | File::BIN;
 
@@ -147,15 +147,15 @@ auto RaftLogManager::Init(char const *dir_name, size_t buffer_capa, size_t n)
                          meta_path.c_str());
   }
 
-  buffer_pool_.Init(n);
+  segment_pool_.Init(n);
   return MakeSuccess();
 }
 
 auto RaftLogManager::AppendEntry(Entry &entry) -> bool
 {
-  bool new_buffer = false;
+  bool new_segment = false;
 
-  auto err = cur_buffer_.AppendEntry(entry, &new_buffer);
+  auto err = cur_segment_.AppendEntry(entry, &new_segment);
   if (err) {
     switch (errcode) {
       case E_SERIALIZE_ENTRY:
@@ -169,25 +169,31 @@ auto RaftLogManager::AppendEntry(Entry &entry) -> bool
     return false;
   }
 
-  if (new_buffer) {
+  if (new_segment) {
+    const auto old_end_idx = cur_segment_.GetEndIndex();
+    const auto new_name = MakeFullPath(
+        RaftLogSegment::MakeLoggingName(old_end_idx + 1));
+
+    // Create the new segment before moving the old one into the pool, so a
+    // failure here leaves the manager with a valid cur_segment_.
+    RaftLogSegment new_segment;
+    if (auto err = new_segment.Init(new_name, ReadOnlyFlag::OFF)) {
+      PErrorSys(err);
+      return false;
+    }
+
+    KRAFT_ASSERT1(new_segment.GetStartIndex() == old_end_idx + 1);
+    new_segment.SetEntriesNum(segment_capa_);
+
     // The start index must greater than the last item.
     // Make the call be O(1)
     auto idx_path_iter = idx_path_map_.emplace_hint(idx_path_map_.end(),
-                                                    cur_buffer_.GetStartIndex(),
-                                                    cur_buffer_.GetFilename());
-    char new_name[KRAFT_FILE_NAME_LEN];
-    auto old_end_idx = (unsigned long long)cur_buffer_.GetEndIndex();
-    snprintf(new_name, sizeof new_name, "%llu-logging.kraftlog",
-             old_end_idx + 1);
-    // The buffer is the latest readonly one,
+                                                    cur_segment_.GetStartIndex(),
+                                                    cur_segment_.GetFilename());
+    // The segment is the latest readonly one,
     // it is likely to be readen by followers
-    buffer_pool_.AddBuffer(idx_path_iter->second, cur_buffer_);
-    RaftLogSegment new_buffer;
-    new_buffer.Init(new_name, ReadOnlyFlag::OFF);
-
-    KRAFT_ASSERT1(new_buffer.GetStartIndex() == old_end_idx + 1);
-    new_buffer.SetEntriesNum(buffer_capa_);
-    cur_buffer_ = std::move(new_buffer);
+    segment_pool_.AddSegment(idx_path_iter->second, cur_segment_);
+    cur_segment_ = std::move(new_segment);
   }
   return true;
 }
@@ -215,24 +221,24 @@ auto RaftLogManager::FetchState(PersistentState *state) -> bool
 
 auto RaftLogManager::GetLastEntryMeta() -> EntryMeta
 {
-  RaftLogSegment *buffer = nullptr;
-  if (cur_buffer_.has_logged_num() > 0) {
-    buffer = &cur_buffer_;
+  RaftLogSegment *segment = nullptr;
+  if (cur_segment_.has_logged_num() > 0) {
+    segment = &cur_segment_;
   } else {
     KRAFT_ASSERT1(idx_path_map_.size() >= 1);
-    auto p_prev_last_buffer_or_err =
-        buffer_pool_.GetLogBuffer((--idx_path_map_.end())->second);
-    if (p_prev_last_buffer_or_err) {
-      PErrorSys(p_prev_last_buffer_or_err.error());
+    auto p_prev_last_segment_or_err =
+        segment_pool_.GetLogSegment((--idx_path_map_.end())->second);
+    if (p_prev_last_segment_or_err) {
+      PErrorSys(p_prev_last_segment_or_err.error());
       return {INVALID_TERM, INVALID_INDEX};
     }
-    buffer = *p_prev_last_buffer_or_err;
-    if (auto err = buffer->FetchEntries()) {
+    segment = *p_prev_last_segment_or_err;
+    if (auto err = segment->FetchEntries()) {
       PErrorSys(err);
       return {INVALID_TERM, INVALID_INDEX};
     }
   }
-  return Entry2Meta(buffer->GetLastEntry());
+  return Entry2Meta(segment->GetLastEntry());
 }
 
 auto RaftLogManager::GetEntryMeta(u64 index) -> u64
@@ -248,21 +254,21 @@ auto RaftLogManager::GetEntryMeta(u64 index) -> u64
 
 auto RaftLogManager::TruncateAfter(u64 index) -> bool
 {
-  auto first_buffer_iter = idx_path_map_.upper_bound(index);
-  if (idx_path_map_.end() == first_buffer_iter) {
-    // This must a index belonging for cur_buffer_
+  auto first_segment_iter = idx_path_map_.upper_bound(index);
+  if (idx_path_map_.end() == first_segment_iter) {
+    // This must a index belonging for cur_segment_
     // since assertion
 
-    if (auto err = cur_buffer_.TruncateAfter(index, false)) {
+    if (auto err = cur_segment_.TruncateAfter(index, false)) {
       PErrorSys(err);
       return false;
     }
   } else {
-    auto buffer_iter = first_buffer_iter;
-    --first_buffer_iter;
-    for (; idx_path_map_.end() != buffer_iter;) {
-      auto const &path = buffer_iter->second;
-      if (auto err = buffer_pool_.RemoveBuffer(path)) {
+    auto segment_iter = first_segment_iter;
+    --first_segment_iter;
+    for (; idx_path_map_.end() != segment_iter;) {
+      auto const &path = segment_iter->second;
+      if (auto err = segment_pool_.RemoveSegment(path)) {
         PErrorSys(err);
         return false;
       }
@@ -272,43 +278,43 @@ auto RaftLogManager::TruncateAfter(u64 index) -> bool
       }
 
       // std::map is based on nodes, this is OK.
-      auto next_buffer_iter = buffer_iter;
-      ++next_buffer_iter;
-      idx_path_map_.erase(buffer_iter);
-      buffer_iter = std::move(next_buffer_iter);
+      auto next_segment_iter = segment_iter;
+      ++next_segment_iter;
+      idx_path_map_.erase(segment_iter);
+      segment_iter = std::move(next_segment_iter);
     }
 
-    // Update cur_buffer_ to buffer located in @p index
-    if (cur_buffer_.GetStartIndex() != first_buffer_iter->first) {
-      auto p_buffer_or_err =
-          buffer_pool_.GetLogBuffer(first_buffer_iter->second);
-      if (p_buffer_or_err) {
-        PErrorSys(p_buffer_or_err.error());
+    // Update cur_segment_ to segment located in @p index
+    if (cur_segment_.GetStartIndex() != first_segment_iter->first) {
+      auto p_segment_or_err =
+          segment_pool_.GetLogSegment(first_segment_iter->second);
+      if (p_segment_or_err) {
+        PErrorSys(p_segment_or_err.error());
         return false;
       }
-      auto &buffer = **p_buffer_or_err;
-      if (auto err = buffer.FetchEntriesBefore(index + 1)) {
+      auto &segment = **p_segment_or_err;
+      if (auto err = segment.FetchEntriesBefore(index + 1)) {
         PErrorSys(err);
         return false;
       }
-      if (0 != remove(cur_buffer_.GetFilename().c_str())) {
+      if (0 != remove(cur_segment_.GetFilename().c_str())) {
         PSysError("Failed to remove the old logging file");
         return false;
       }
 
-      if (auto err = buffer_pool_.RemoveBuffer(first_buffer_iter->second, index,
+      if (auto err = segment_pool_.RemoveSegment(first_segment_iter->second, index,
                                                TruncateFlag::ON))
       {
         PErrorSys(err);
         return false;
       }
 
-      cur_buffer_ = std::move(buffer);
+      cur_segment_ = std::move(segment);
 #ifndef NDEBUG
-      cur_buffer_.is_readonly_ = false;
+      cur_segment_.is_readonly_ = false;
 #endif
-      if (!cur_buffer_.RenameToLogging()) {
-        PSysError("Failed to rename the readonly buffer to logging log");
+      if (!cur_segment_.RenameToLogging()) {
+        PSysError("Failed to rename the readonly segment to logging log");
         return false;
       }
     }
@@ -320,37 +326,37 @@ auto RaftLogManager::GetEntry(u64 index, Entry const **entry) -> bool
 {
   KRAFT_ASSERT1(entry);
 
-  if (cur_buffer_.GetStartIndex() <= index) {
-    *entry = &cur_buffer_[index];
+  if (cur_segment_.GetStartIndex() <= index) {
+    *entry = &cur_segment_[index];
     return true;
   }
 
   auto idx_path_iter = idx_path_map_.upper_bound(index);
   --idx_path_iter;
-  auto p_buffer_or_err = buffer_pool_.GetLogBuffer(idx_path_iter->second);
-  if (p_buffer_or_err) {
+  auto p_segment_or_err = segment_pool_.GetLogSegment(idx_path_iter->second);
+  if (p_segment_or_err) {
     return false;
   }
-  auto p_buffer = *p_buffer_or_err;
+  auto p_segment = *p_segment_or_err;
 
-  if (auto err = p_buffer->FetchEntries()) {
+  if (auto err = p_segment->FetchEntries()) {
     PErrorSys(err);
     return false;
   }
-  *entry = &(*p_buffer)[index];
+  *entry = &(*p_segment)[index];
   return true;
 }
 
 auto RaftLogManager::SetBufferCapacity(size_t n) -> void
 {
-  buffer_capa_ = n;
-  cur_buffer_.SetEntriesNum(n);
+  segment_capa_ = n;
+  cur_segment_.SetEntriesNum(n);
 }
 
 auto RaftLogManager::DebugPrint() -> void
 {
   printf("The path_idx_map of pool: \n");
-  for (auto const &path_idx : buffer_pool_.path_idx_map_) {
+  for (auto const &path_idx : segment_pool_.path_idx_map_) {
     printf("(%s -> %llu)\n", path_idx.first, (ull)path_idx.second.idx);
   }
 

@@ -29,7 +29,7 @@ class RaftLogManager {
    *
    * \return
    */
-  Error Init(char const *dir_name, size_t buffer_capa = 10000, size_t n = 1);
+  Error Init(char const *dir_name, size_t segment_capa = 10000, size_t n = 1);
 
   bool AppendEntry(Entry &entry);
   bool UpdateState(PersistentState const &state);
@@ -45,25 +45,30 @@ class RaftLogManager {
   void DebugPrint();
 
  private:
-  KRAFT_INLINE auto MakePath(char const *name, size_t n) const -> std::string
+  KRAFT_INLINE auto MakeFullPath(char const *name, size_t n) const -> std::string
   {
     std::string new_path = dir_path_;
-    if (new_path.back() != '/') {
+    if (new_path.empty() || new_path.back() != '/') {
       new_path += '/';
     }
     new_path.append(name, n);
     return new_path;
   }
 
+  KRAFT_INLINE auto MakeFullPath(std::string const &name) const -> std::string
+  {
+    return MakeFullPath(name.data(), name.size());
+  }
+
   friend class RaftLogSegmentPool;
 
   std::string dir_path_;
   std::map<u64, std::string> idx_path_map_;
-  RaftLogSegmentPool buffer_pool_;
-  size_t buffer_capa_;
+  RaftLogSegmentPool segment_pool_;
+  size_t segment_capa_;
 
   std::string cur_path_;
-  RaftLogSegment cur_buffer_;
+  RaftLogSegment cur_segment_;
 
   File meta_file_;
 };
