@@ -13,8 +13,9 @@ set(CMAKE_CXX_STANDARD 17)
 
 set(3_PARTY_DIR "${PROJECT_SOURCE_DIR}/third-party")
 
-add_subdirectory(kraft)
 add_subdirectory(third-party)
+
+add_subdirectory(kraft)
   
 if (KRAFT_TESTS)
   add_subdirectory(test)

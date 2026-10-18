@@ -5,9 +5,9 @@ file(GLOB KRAFT_BENCH_SOURCES "${PROJECT_SOURCE_DIR}/test/*/*bench*.cc")
 message(STATUS "kraft test source files: ${KRAFT_TEST_SOURCES}")
 message(STATUS "kraft bench source files: ${KRAFT_BENCH_SOURCES}")
 
-if (NOT ${BUILD_ALL_TESTS})
+if (NOT KRAFT_BUILD_ALL_TESTS)
   message(STATUS "[The kraft test and bench files are excluded from the build of target all]")
-endif (NOT ${BUILD_ALL_TESTS})
+endif (NOT KRAFT_BUILD_ALL_TESTS)
 
 message(STATUS "kraft protoc = ${Protobuf_PROTOC_EXECUTABLE}")
 ############################################
@@ -26,14 +26,21 @@ macro (GenTest SRC)
       list(APPEND test_sources ${kraft_test_filename}.pb.cc)
     endif ()
 
-    if (${BUILD_ALL_TESTS})
+    if (KRAFT_BUILD_ALL_TESTS)
       add_executable(${kraft_test_filename} ${test_sources})
     else ()
       message(STATUS "${kraft_test_filename} is excluded from target all")
       add_executable(${kraft_test_filename} EXCLUDE_FROM_ALL ${test_sources})
-    endif (${BUILD_ALL_TESTS})
+    endif (KRAFT_BUILD_ALL_TESTS)
   
-    target_link_libraries(${kraft_test_filename} PRIVATE ${ARGN})
+    if (kraft_test_filename STREQUAL "crc_test")
+      # Standalone smoke test for the vendored crc32c; it has its own main()
+      # and must not pull in the whole kraft library.
+      target_link_libraries(${kraft_test_filename} PRIVATE crc32c)
+    else ()
+      target_link_libraries(${kraft_test_filename} PRIVATE ${ARGN})
+    endif ()
+
     target_include_directories(
       ${kraft_test_filename}
       PRIVATE ${CMAKE_CURRENT_BINARY_DIR}
@@ -56,8 +63,10 @@ find_package(Protobuf REQUIRED CONFIG)
 
 #set(TEST_LIBS kraft kraft_protobuf)
 #set(BENCH_LIBS kraft kraft_protobuf)
-set(TEST_LIBS kraft protobuf::libprotobuf)
-set(BENCH_LIBS kraft protobuf::libprotobuf)
+# crc32c is exposed to the tests so they can include <crc32c/crc32c.h>
+# directly; kraft itself only links it privately.
+set(TEST_LIBS kraft protobuf::libprotobuf crc32c)
+set(BENCH_LIBS kraft protobuf::libprotobuf crc32c)
 
 GenTest(KRAFT_TEST_SOURCES GTest::gtest GTest::gtest_main ${TEST_LIBS})
 GenTest(KRAFT_BENCH_SOURCES benchmark benchmark_main ${BENCH_LIBS})

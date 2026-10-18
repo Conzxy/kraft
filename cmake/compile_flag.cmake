@@ -43,9 +43,12 @@ else ()
   )
 
   # Clang和GCC有些选项是不通用的
+  message(STATUS "CMAKE_CXX_COMPILER_ID: ${CMAKE_CXX_COMPILER_ID}")
   if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
     list(REMOVE_ITEM CXX_FLAGS "-Wno-return-local-addr")
     list(REMOVE_ITEM CXX_FLAGS "-rdynamic")
+    list(REMOVE_ITEM CXX_FLAGS "-Wno-class-memaccess")
+    list(REMOVE_ITEM CXX_FLAGS "-Wno-maybe-uninitialized")
     list(APPEND CXX_FLAGS "-Wthread-safety")
   endif()
 

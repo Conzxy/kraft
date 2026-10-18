@@ -35,6 +35,10 @@ else ()
   target_link_libraries(kraft PUBLIC kraft_protobuf_to_link)
 endif ()
 
+# Vendored under third-party/ and used by the log storage. It is a private
+# implementation detail, so its usage requirements do not leak to consumers.
+target_link_libraries(kraft PRIVATE crc32c)
+
 target_include_directories(
   kraft
   PUBLIC
