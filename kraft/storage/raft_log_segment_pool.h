@@ -31,14 +31,14 @@ class RaftLogSegmentPool {
   /**
    * \brief
    *
-   * \Param sz The maximum size of buffer this pool can hold
+   * \Param sz The maximum size of segment this pool can hold
    *
    * \Return
    */
   void Init(size_t sz);
 
   /**
-   * \brief Get the buffer in which the index belonging
+   * \brief Get the segment in which the index belonging
    *
    * \Param filename Must from the RaftLogManager
    *
@@ -47,46 +47,23 @@ class RaftLogSegmentPool {
    * \errcode
    *  see RaftLogSegment::Init()
    */
-  ErrorOr<RaftLogSegment *> GetLogBuffer(std::string const &filename);
+  ErrorOr<RaftLogSegment *> GetLogSegment(std::string const &filename);
 
   /**
-   * \brief Remove the buffer from pool
+   * \brief Remove the segment from pool
    *
    * \Param path
    *
    * \Return
    */
-  Error RemoveBuffer(std::string const &path, u64 index, TruncateFlag truncate);
+  Error RemoveSegment(std::string const &path, u64 index, TruncateFlag truncate);
 
-  Error RemoveBuffer(std::string const &path)
-  {
-    return RemoveBuffer(path, INVALID_INDEX, TruncateFlag::OFF);
+  Error RemoveSegment(std::string const &path) {
+    return RemoveSegment(path, INVALID_INDEX, TruncateFlag::OFF);
   }
 
-  void AddBuffer(std::string const &path, RaftLogSegment &buffer);
-
+  void AddSegment(std::string const &path, RaftLogSegment &segment);
  private:
-  std::list<u64> fifo_indices_;
-
-  struct BufferCtx {
-    size_t idx;
-    decltype(fifo_indices_)::iterator fifo_iter;
-  };
-
-  HashMap<char const *, BufferCtx> path_idx_map_;
-  using PathIdxMapIter = decltype(path_idx_map_)::iterator;
-
-  struct RaftLogBufferWithIter : public RaftLogSegment {
-    // using RaftLogBuffer::RaftLogBuffer;
-    using RaftLogSegment::RaftLogSegment;
-
-    decltype(path_idx_map_)::iterator iter_;
-  };
-
-  std::vector<RaftLogBufferWithIter> buffers_;
-
-  std::vector<u64> free_indices_;
-
   KRAFT_INLINE u64 GetVictimIndex()
   {
     KRAFT_ASSERT(free_indices_.empty(), "There are no free index");
@@ -100,30 +77,52 @@ class RaftLogSegmentPool {
   KRAFT_INLINE void UpdateVictim(u64 index)
   {
     fifo_indices_.push_back(index);
-    KRAFT_ASSERT(fifo_indices_.size() <= buffers_.size(),
-                 "The victim index list size must be <= buffer num");
+    KRAFT_ASSERT(fifo_indices_.size() <= segments_.size(),
+                 "The victim index list size must be <= segment num");
   }
 
-  KRAFT_INLINE void UpdateBufferAndMapIter(u64 index, PathIdxMapIter iter)
+ private:
+  std::list<u64> fifo_indices_;
+
+  struct SegmentCtx {
+    size_t idx;
+    decltype(fifo_indices_)::iterator fifo_iter;
+  };
+
+  HashMap<char const *, SegmentCtx> path_idx_map_;
+  using PathIdxMapIter = decltype(path_idx_map_)::iterator;
+
+  struct RaftLogSegmentWithIter : public RaftLogSegment {
+    // using RaftLogSegment::RaftLogSegment;
+    using RaftLogSegment::RaftLogSegment;
+
+    decltype(path_idx_map_)::iterator iter_;
+  };
+
+  std::vector<RaftLogSegmentWithIter> segments_;
+
+  std::vector<u64> free_indices_;
+
+  KRAFT_INLINE void UpdateSegmentAndMapIter(u64 index, PathIdxMapIter iter)
   {
-    // Register the old buffer idx to invalid
-    auto *buffer = &buffers_[index];
-    if (path_idx_map_.end() != buffer->iter_) {
-      buffer->iter_->second.idx = -1;
+    // Register the old segment idx to invalid
+    auto *segment = &segments_[index];
+    if (path_idx_map_.end() != segment->iter_) {
+      segment->iter_->second.idx = -1;
     }
 
     // Update current iterator
-    // index: for get buffer check exists
-    // fifo_iter: for remove buffer to remove fifo entry and add to free indices
+    // index: for get segment check exists
+    // fifo_iter: for remove segment to remove fifo entry and add to free indices
     if (iter != path_idx_map_.end()) {
       iter->second.idx = index;
       iter->second.fifo_iter = --fifo_indices_.end();
     }
 
-    buffer->iter_ = iter;
+    segment->iter_ = iter;
   }
 
-  KRAFT_INLINE u64 GetBufferIndex(PathIdxMapIter iter)
+  KRAFT_INLINE u64 GetSegmentIndex(PathIdxMapIter iter)
   {
     u64 index = -1;
 
@@ -141,9 +140,11 @@ class RaftLogSegmentPool {
       KRAFT_ASSERT1((u64)-1 != index);
     }
 
-    UpdateBufferAndMapIter(index, iter);
+    UpdateSegmentAndMapIter(index, iter);
     return index;
   }
+
+
 };
 } // namespace kraft
 #endif

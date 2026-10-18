@@ -12,9 +12,9 @@ RaftLogSegmentPool::~RaftLogSegmentPool() noexcept {}
 
 auto RaftLogSegmentPool::Init(size_t sz) -> void
 {
-  buffers_.resize(sz);
-  for (auto &buffer : buffers_) {
-    buffer.iter_ = path_idx_map_.end();
+  segments_.resize(sz);
+  for (auto &segment : segments_) {
+    segment.iter_ = path_idx_map_.end();
   }
 
   free_indices_.reserve(sz);
@@ -23,62 +23,62 @@ auto RaftLogSegmentPool::Init(size_t sz) -> void
   }
 }
 
-auto RaftLogSegmentPool::GetLogBuffer(std::string const &path)
+auto RaftLogSegmentPool::GetLogSegment(std::string const &path)
     -> ErrorOr<RaftLogSegment *>
 {
   // Construct a dummy value to call emplace()
   // instead of calling find() then calling emplace().
   // This is redundant and naive.
-  BufferCtx ctx;
+  SegmentCtx ctx;
   ctx.fifo_iter = fifo_indices_.end();
   ctx.idx = INVALID_INDEX;
 
   const auto emplace_ret = path_idx_map_.emplace(path.c_str(), std::move(ctx));
   const auto does_exists = emplace_ret.second;
   auto path_idx_iter = emplace_ret.first;
-  RaftLogBufferWithIter *ret_buffer = nullptr;
+  RaftLogSegmentWithIter *ret_segment = nullptr;
 
   if (!does_exists || (u64)-1 == path_idx_iter->second.idx) {
-    // The buffer is don't represent in the pool
-    RaftLogBufferWithIter new_buffer;
-    auto error = new_buffer.Init(path.c_str(), ReadOnlyFlag::ON);
+    // The segment is don't represent in the pool
+    RaftLogSegmentWithIter new_segment;
+    auto error = new_segment.Init(path.c_str(), ReadOnlyFlag::ON);
     if (error) {
       return error;
     }
-    new_buffer.iter_ = path_idx_iter;
+    new_segment.iter_ = path_idx_iter;
 
-    u64 index = GetBufferIndex(path_idx_iter);
+    u64 index = GetSegmentIndex(path_idx_iter);
 
-    ret_buffer = &buffers_[index];
-    *ret_buffer = std::move(new_buffer);
+    ret_segment = &segments_[index];
+    *ret_segment = std::move(new_segment);
   } else {
     // Hit, just return
-    ret_buffer = &buffers_[path_idx_iter->second.idx];
-    KRAFT_ASSERT1((u64)-1 != ret_buffer->iter_->second.idx);
+    ret_segment = &segments_[path_idx_iter->second.idx];
+    KRAFT_ASSERT1((u64)-1 != ret_segment->iter_->second.idx);
   }
 
-  return ret_buffer;
+  return ret_segment;
 }
 
-auto RaftLogSegmentPool::RemoveBuffer(std::string const &path, u64 index,
+auto RaftLogSegmentPool::RemoveSegment(std::string const &path, u64 index,
                                       TruncateFlag truncate) -> Error
 {
   auto path_idx_iter = path_idx_map_.find(path.c_str());
   if (!(path_idx_map_.end() == path_idx_iter ||
         path_idx_iter->second.idx == (u64)-1))
   {
-    // Since buffer is managed by pool, we must truncate it here.
-    auto buffer_idx = path_idx_iter->second.idx;
-    auto &buffer = buffers_[buffer_idx];
+    // Since segment is managed by pool, we must truncate it here.
+    auto segment_idx = path_idx_iter->second.idx;
+    auto &segment = segments_[segment_idx];
     if (INVALID_INDEX == index) {
-      index = buffer.GetStartIndex();
+      index = segment.GetStartIndex();
     }
-    if (auto err = buffer.TruncateAfter(index, TruncateFlag::ON == truncate)) {
-      return MakeMsgErrorf("Failed to truncate the buffer in %s\n",
+    if (auto err = segment.TruncateAfter(index, TruncateFlag::ON == truncate)) {
+      return MakeMsgErrorf("Failed to truncate the segment in %s\n",
                            path.c_str());
     }
     fifo_indices_.erase(path_idx_iter->second.fifo_iter);
-    free_indices_.push_back(buffer_idx);
+    free_indices_.push_back(segment_idx);
   }
 
   // The path is invalid now
@@ -86,20 +86,20 @@ auto RaftLogSegmentPool::RemoveBuffer(std::string const &path, u64 index,
   return MakeSuccess();
 }
 
-auto RaftLogSegmentPool::AddBuffer(std::string const &path,
-                                   RaftLogSegment &buffer) -> void
+auto RaftLogSegmentPool::AddSegment(std::string const &path,
+                                   RaftLogSegment &segment) -> void
 {
   // The path must be not added to this pool
-  BufferCtx ctx;
+  SegmentCtx ctx;
   ctx.fifo_iter = fifo_indices_.end();
   ctx.idx = INVALID_INDEX;
 
   const auto emplace_ret = path_idx_map_.emplace(path.c_str(), std::move(ctx));
   auto path_idx_iter = emplace_ret.first;
 
-  auto index = GetBufferIndex(path_idx_iter);
-  RaftLogBufferWithIter buffer_iter;
-  (RaftLogSegment &)buffer_iter = std::move(buffer);
-  buffer_iter.iter_ = std::move(path_idx_iter);
-  buffers_[index] = std::move(buffer_iter);
+  auto index = GetSegmentIndex(path_idx_iter);
+  RaftLogSegmentWithIter segment_iter;
+  (RaftLogSegment &)segment_iter = std::move(segment);
+  segment_iter.iter_ = std::move(path_idx_iter);
+  segments_[index] = std::move(segment_iter);
 }

@@ -42,7 +42,7 @@ TEST(raft_log_segment_pool, main)
   pool.Init(5);
   start_idx = 1;
   for (int i = 0; i < 5; ++i) {
-    auto p_buffer_or_err = pool.GetLogBuffer(lognames[i]);
+    auto p_buffer_or_err = pool.GetLogSegment(lognames[i]);
     printf("logname: %s\n", lognames[i].c_str());
     if (p_buffer_or_err) {
       fprintf(stderr, "Failed to get the buffer [%d]\n", i);
@@ -72,7 +72,7 @@ TEST(raft_log_segment_pool, victim)
   auto start_idx = 501;
   auto entry_num = 100;
   int i = 5;
-  auto p_buffer_or_err = pool.GetLogBuffer(lognames[i]);
+  auto p_buffer_or_err = pool.GetLogSegment(lognames[i]);
   if (p_buffer_or_err) {
     fprintf(stderr, "Failed to get the buffer [%d]\n", i);
     printf("Reason: %s\n", p_buffer_or_err.info()->GetMessage().c_str());
