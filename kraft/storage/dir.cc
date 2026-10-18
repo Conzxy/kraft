@@ -55,11 +55,11 @@ bool Dir::ApplyDirEntry(ApplyDirEntryCallback apply_cb)
 
   errno = 0;
   auto ent = readdir(dir_);
-  if (!ent && errno != 0) {
-    return false;
+  if (!ent) {
+    return 0 == errno;
   }
 
-  apply_cb(ent);
+  apply_cb(DirEntry(*ent));
   return true;
 }
 
@@ -67,18 +67,16 @@ bool Dir::ApplyDirEntries(ApplyDirEntryCallback apply_cb)
 {
   if (!dir_) return false;
 
-  errno = 0;
+  for (;;) {
+    // Reset errno before each call, since the callback may change it.
+    errno = 0;
+    auto ent = readdir(dir_);
+    if (!ent) {
+      return 0 == errno;
+    }
 
-  auto ent = readdir(dir_);
-
-  for (; ent; ent = readdir(dir_)) {
-    apply_cb(ent);
+    apply_cb(DirEntry(*ent));
   }
-
-  if (errno != 0) {
-    return false;
-  }
-  return true;
 }
 
 auto kraft::MakeDir(char const *dir, int mode) -> bool

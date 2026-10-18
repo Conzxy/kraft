@@ -19,11 +19,11 @@ static void test_dir(char const *dir_name)
   Dir dir;
   ASSERT_TRUE(dir.Open("~"));
 
-  EXPECT_TRUE(dir.ApplyDirEntries([](DirEntry const *entry) {
-    if (DT_REG == entry->d_type) {
-      printf("Regular file: %s\n", entry->d_name);
-    } else if (DT_DIR == entry->d_type) {
-      printf("Dir: %s\n", entry->d_name);
+  EXPECT_TRUE(dir.ApplyDirEntries([](DirEntry const &entry) {
+    if (entry.IsRegularFile()) {
+      printf("Regular file: %s\n", entry.name().c_str());
+    } else if (entry.IsDirectory()) {
+      printf("Dir: %s\n", entry.name().c_str());
     }
   }));
 }

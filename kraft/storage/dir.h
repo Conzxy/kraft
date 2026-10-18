@@ -12,11 +12,43 @@
 
 namespace kraft {
 
-using DirEntry = struct dirent;
+/**
+ * A wrapper of `struct dirent`.
+ *
+ * The entry returned by readdir() is only valid until the next readdir()
+ * call, so the wrapper owns a copy of the fields we need.
+ */
+class DirEntry {
+ public:
+  DirEntry() noexcept = default;
+
+  explicit DirEntry(struct dirent const &entry)
+    : name_(entry.d_name)
+    , type_(entry.d_type)
+    , ino_(entry.d_ino)
+  {
+  }
+
+  KRAFT_INLINE std::string const &name() const noexcept { return name_; }
+  KRAFT_INLINE unsigned char type() const noexcept { return type_; }
+  KRAFT_INLINE ino_t ino() const noexcept { return ino_; }
+
+  KRAFT_INLINE bool IsRegularFile() const noexcept
+  {
+    return DT_REG == type_;
+  }
+  KRAFT_INLINE bool IsDirectory() const noexcept { return DT_DIR == type_; }
+  KRAFT_INLINE bool IsSymlink() const noexcept { return DT_LNK == type_; }
+
+ private:
+  std::string name_;
+  unsigned char type_ = DT_UNKNOWN;
+  ino_t ino_ = 0;
+};
 
 class Dir {
  public:
-  using ApplyDirEntryCallback = std::function<void(DirEntry const *ent)>;
+  using ApplyDirEntryCallback = std::function<void(DirEntry const &ent)>;
 
   Dir();
   ~Dir() noexcept;
