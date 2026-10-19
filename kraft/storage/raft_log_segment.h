@@ -95,6 +95,7 @@ class RaftLogSegment {
   static constexpr u32 kFileMagic = 0x5446524B; // bytes 'K' 'R' 'F' 'T'
   static constexpr u16 kFileVersion = 1;
   static constexpr size_t kFileHeaderSize = sizeof(u32) + 2 * sizeof(u16);
+  static constexpr size_t kRecordHeaderSize = sizeof(size_header_t) + sizeof(u32);
 
   struct LogName {
     u64 start_index = INVALID_INDEX;
@@ -249,10 +250,13 @@ class RaftLogSegment {
    * \brief Read, validate and append one entry.
    *
    * \Param expected_index The index the entry must have.
+   * \Param allow_torn_tail Treat a truncated trailing record as kEof instead of
+   *                       an error. Used while recovering the logging file.
    * \Param entry_buf Reusable buffer for the serialized entry.
-   * \Param result kEof if the file ended before a complete size header.
+   * \Param result kEof if the file ended before a complete record.
    */
-  Error ReadEntry(u64 expected_index, std::vector<unsigned char> *entry_buf,
+  Error ReadEntry(u64 expected_index, bool allow_torn_tail,
+                  std::vector<unsigned char> *entry_buf,
                   EntryReadResult *result);
 
   /**

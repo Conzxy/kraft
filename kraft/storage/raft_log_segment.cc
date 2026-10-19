@@ -238,6 +238,8 @@ auto RaftLogSegment::CheckFileHeader() -> Error
 
   return MakeSuccess();
 }
+
+auto RaftLogSegment::ReadEntry(u64 expected_index, bool allow_torn_tail,
                                std::vector<unsigned char> *entry_buf,
                                EntryReadResult *result) -> Error
 {
@@ -246,19 +248,24 @@ auto RaftLogSegment::CheckFileHeader() -> Error
 
   *result = EntryReadResult::kError;
 
-  size_header_t size_header = 0;
-  auto ret = file_.Read(&size_header, sizeof size_header);
+  u8 record_header[kRecordHeaderSize] = {};
+  auto ret = file_.Read(record_header, sizeof record_header);
   if (File::INVALID_RETURN == ret) {
     errcode = E_READ_FILE;
     return MakeMsgErrorf(
-        "Failed to read the size header of entry index %llu in %s",
+        "Failed to read the record header of entry index %llu in %s",
         (ull)expected_index, file_.filename().c_str());
   }
 
-  if (ret < sizeof size_header) {
+  if (ret < sizeof record_header) {
     *result = EntryReadResult::kEof;
     return MakeSuccess();
   }
+
+  const auto size_header =
+      static_cast<size_header_t>(le::DecodeU32(record_header));
+  const auto expected_crc =
+      le::DecodeU32(record_header + sizeof(size_header_t));
 
   if (0 == size_header) {
     errcode = E_INVALID_LOG_ENTRY;
@@ -284,12 +291,29 @@ auto RaftLogSegment::CheckFileHeader() -> Error
   }
 
   if (ret < size_header) {
+    if (allow_torn_tail) {
+      // A torn write at the tail of the logging file; the caller decides where
+      // to truncate.
+      *result = EntryReadResult::kEof;
+      return MakeSuccess();
+    }
+
     errcode = E_ENTRY_INCOMPELTE;
     return MakeMsgErrorf("The entry %llu is incomplete in %s",
                          (ull)expected_index, file_.filename().c_str());
   }
 
   KRAFT_ASSERT1(entry_buf->size() == size_header);
+
+  const auto actual_crc = crc::ComputeRecord(size_header, entry_buf->data());
+  if (actual_crc != expected_crc) {
+    errcode = E_LOG_CHECKSUM_MISMATCH;
+    return MakeMsgErrorf(
+        "The checksum of entry index %llu is incorrect in %s "
+        "(expected = %u, actual = %u)",
+        (ull)expected_index, file_.filename().c_str(), expected_crc,
+        actual_crc);
+  }
 
   // Parse and verify the entry index.
   entries_.emplace_back();
@@ -345,7 +369,7 @@ auto RaftLogSegment::FetchEntriesBefore(u64 index) -> Error
   for (u64 i = 0; i < num; ++i) {
     const auto expected_index = start_index_ + i;
     EntryReadResult result;
-    if (auto err = ReadEntry(expected_index, &entry_buf, &result)) {
+    if (auto err = ReadEntry(expected_index, false, &entry_buf, &result)) {
       return err;
     }
 
@@ -383,12 +407,13 @@ auto RaftLogSegment::LoadLoggingEntries() -> Error
                          file_.filename().c_str());
   }
 
+  size_t valid_end = kFileHeaderSize;
   std::vector<unsigned char> entry_buf;
   for (;;) {
     const auto position = file_.GetCurrentPosition();
-    if (position < 0) {
+    if (position < 0 || static_cast<size_t>(position) > file_size) {
       errcode = E_READ_FILE;
-      return MakeMsgErrorf("Failed to get the position of %s",
+      return MakeMsgErrorf("Invalid position in %s",
                            file_.filename().c_str());
     }
 
@@ -397,21 +422,23 @@ auto RaftLogSegment::LoadLoggingEntries() -> Error
       break;
     }
 
-    // A torn write may leave a partial size header at the tail. Everything
-    // from here on is uncommitted; stop at the last complete entry.
+    // A torn write may leave a partial record header at the tail. Don't read
+    // it, so the position stays at the last complete record and the file can
+    // be truncated below.
     // 在Read之前检测header是否不完整，可以让文件指针停在最后一个完整的entry之后，
     // 避免Read时返回Eof丢失边界，方便直接truncate掉不完整的entry
-    if (offset + sizeof(size_header_t) > file_size) {
+    if (file_size - offset < kRecordHeaderSize) {
       break;
     }
 
     const auto expected_index = start_index_ + entries_.size();
     EntryReadResult result;
-    if (auto err = ReadEntry(expected_index, &entry_buf, &result)) {
+    if (auto err = ReadEntry(expected_index, true, &entry_buf, &result)) {
       return err;
     }
 
     if (EntryReadResult::kEof == result) {
+      // A truncated trailing record (partial payload).
       break;
     }
 
@@ -420,6 +447,22 @@ auto RaftLogSegment::LoadLoggingEntries() -> Error
       return MakeMsgErrorf("Failed to read entry index %llu in %s",
                            (ull)expected_index, file_.filename().c_str());
     }
+
+    // The position is validated at the top of the next iteration.
+    valid_end = static_cast<size_t>(file_.GetCurrentPosition());
+  }
+
+  // A torn trailing record is uncommitted; cut it off so a later append does
+  // not produce a record stream that can never be parsed again.
+  if (valid_end < file_size) {
+    if (0 != ftruncate(file_.GetNativeHandler(),
+                       static_cast<off_t>(valid_end))) {
+      errcode = E_TRUNCATE;
+      return MakeMsgErrorf("Failed to truncate the torn tail of %s to %zu",
+                           file_.filename().c_str(), valid_end);
+    }
+    // fseek() clears the EOF indicator left by the short read.
+    file_.SeekEnd(0);
   }
 
   return MakeSuccess();
@@ -470,17 +513,28 @@ auto RaftLogSegment::AppendEntry(Entry entry, bool *new_buffer) -> Error
   KRAFT_ASSERT1(new_buffer);
   *new_buffer = false;
 
-  const size_header_t size_header = entry.ByteSizeLong();
-  std::vector<u8> entry_buf(size_header + sizeof size_header);
-  memcpy(&entry_buf[0], &size_header, sizeof size_header);
-  if (!entry.SerializeWithCachedSizesToArray(&entry_buf[sizeof size_header])) {
-    errcode = E_SERIALIZE_ENTRY;
-    return MakeMsgErrorf("Failed to serialize entry [%llu] to %s",
-                         GetCurrentIndex(),
-                         file_.filename().c_str());
+  const auto payload_size = entry.ByteSizeLong();
+  if (payload_size > kMaxEntrySize) {
+    errcode = E_ENTRY_TOO_LARGE;
+    return MakeMsgErrorf("The serialized entry is too large: %zu bytes",
+                         payload_size);
   }
 
-  if (File::INVALID_RETURN == file_.Write(entry_buf.data(), entry_buf.size())) {
+  const auto size_header = static_cast<size_header_t>(payload_size);
+  std::vector<u8> record(kRecordHeaderSize + size_header);
+  le::EncodeU32(record.data(), size_header);
+  if (!entry.SerializeWithCachedSizesToArray(record.data() +
+                                             kRecordHeaderSize)) {
+    errcode = E_SERIALIZE_ENTRY;
+    return MakeMsgErrorf("Failed to serialize entry [%llu] to %s",
+                         (ull)GetCurrentIndex(),
+                         file_.filename().c_str());
+  }
+  le::EncodeU32(
+      record.data() + sizeof(size_header_t),
+      crc::ComputeRecord(size_header, record.data() + kRecordHeaderSize));
+
+  if (file_.Write(record.data(), record.size()) != record.size()) {
     errcode = E_WRITE_FILE;
     return MakeMsgErrorf("Failed to write entry binary to file");
   }
