@@ -17,18 +17,14 @@ RaftLogSegment buffer;
 
 TEST(raft_log_segment, create)
 {
-  auto err = buffer.Init("1-logging.kraftlog", ReadOnlyFlag::OFF);
+  remove("1-logging.kraftlog");
+  ASSERT_FALSE(buffer.InitAsLogging("1-logging.kraftlog"));
+
   ASSERT_EQ(buffer.GetStartIndex() == 1, true);
   buffer.SetEntriesNum(NUM);
   // buffer.SetStartIndex(1);
   ASSERT_EQ(buffer.GetCapacitry(), NUM);
   ASSERT_EQ(buffer.GetEndIndex(), 0);
-  EXPECT_TRUE(!err);
-  if (err) {
-    printf("Failed to create buffer: %s\n", err.info()->GetMessage().c_str());
-    perror("file error:");
-    return;
-  }
 
   if (buffer.TruncateAll(true)) {
     printf("Failed to empty the file\n");

@@ -140,9 +140,9 @@ TEST_F(RaftLogRecoveryTest, recreates_logging_segment_at_last_end_plus_one)
 // The segment limit is the number of entries, not std::vector::capacity().
 TEST_F(RaftLogRecoveryTest, capacity_is_max_entries_not_vector_capacity)
 {
-  RaftLogSegment segment;
   const auto path = (log_dir_ / "1-logging.kraftlog").string();
-  ASSERT_FALSE(segment.Init(path.c_str(), ReadOnlyFlag::OFF));
+  RaftLogSegment segment;
+  ASSERT_FALSE(segment.InitAsLogging(path));
 
   // Grow the vector first. SetEntriesNum() must still report the requested
   // entry limit afterwards, even though vector::reserve() never shrinks.

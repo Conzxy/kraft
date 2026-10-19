@@ -22,9 +22,11 @@ TEST(raft_log_segment_pool, main)
   int start_idx = 1;
 
   for (int i = 0; i < logfile_num; ++i) {
+    const auto logging_name = RaftLogSegment::MakeLoggingName(start_idx);
+    remove(logging_name.c_str());
+
     RaftLogSegment buffer;
-    auto err = buffer.Init(RaftLogSegment::MakeLoggingName(start_idx),
-                           ReadOnlyFlag::OFF);
+    ASSERT_FALSE(buffer.InitAsLogging(logging_name));
     buffer.SetEntriesNum(entry_num);
     Entry entry;
     bool new_buffer;
@@ -122,11 +124,15 @@ class RaftLogSegmentPoolCacheTest : public ::testing::Test {
   // itself. Returns the sealed path.
   std::string MakeSealedSegment(u64 start, size_t count)
   {
-    RaftLogSegment segment;
     const auto logging_path =
         (dir_ / RaftLogSegment::MakeLoggingName(start)).string();
 
-    EXPECT_FALSE(segment.Init(logging_path, ReadOnlyFlag::OFF));
+    RaftLogSegment segment;
+    auto err = segment.InitAsLogging(logging_path);
+    if (err) {
+      ADD_FAILURE() << "init failed: " << err.info()->GetMessage();
+      return {};
+    }
     segment.SetEntriesNum(count);
 
     Entry entry;
