@@ -1,11 +1,11 @@
 // SPDX-LICENSE-IDENTIFIER: BSD-2-Clause
 #include "kraft/storage/raft_log_manager.h"
 
-#include <unistd.h>
+#include <cstdio>
 
 #include "kraft/macro.h"
 #include "kraft/storage/dir.h"
-#include "kraft/storage/file.h"
+#include "kraft/storage/raft_log_meta_record.h"
 #include "kraft/util.h"
 
 #include "kraft/error_code.h"
@@ -124,24 +124,8 @@ auto RaftLogManager::Init(char const *dir_name, size_t segment_capa, size_t n)
     cur_segment_.SetEntriesNum(segment_capa_);
   }
 
-  const auto meta_path =
+  meta_path_ =
       MakeFullPath(KRAFT_META_LOG_NAME, sizeof(KRAFT_META_LOG_NAME) - 1);
-
-  int meta_file_mode = File::READ | File::BIN;
-
-  // If metafile doesn't exists, first create it.
-  // The WRITE flag don't creat file if it does not exists.
-  if (0 == access(meta_path.c_str(), F_OK)) {
-    meta_file_mode |= File::WRITE;
-  } else {
-    meta_file_mode |= File::TRUNC;
-  }
-
-  if (!meta_file_.Open(meta_path, meta_file_mode)) {
-    errcode = E_OPEN_META_FILE;
-    return MakeMsgErrorf("Failed to open the kraft meta file: %s",
-                         meta_path.c_str());
-  }
 
   segment_pool_.Init(n);
   return MakeSuccess();
@@ -196,23 +180,28 @@ auto RaftLogManager::AppendEntry(Entry &entry) -> bool
 
 auto RaftLogManager::UpdateState(PersistentState const &state) -> bool
 {
-  KRAFT_ASSERT(meta_file_.IsValid(),
-               "The file handle of meta data must be valid");
+  KRAFT_ASSERT(!meta_path_.empty(), "Init() must be called first");
 
-  if (!state.SerializeToFileDescriptor(fileno(meta_file_.GetFileHandler()))) {
-    perror("Failed to serialize meta state to the file");
-    meta_file_.Rewind();
+  if (auto err = RaftLogMetaRecord::Store(meta_path_, state)) {
+    PErrorSys(err);
     return false;
   }
-  meta_file_.Rewind();
   return true;
 }
 
 auto RaftLogManager::FetchState(PersistentState *state) -> bool
 {
-  auto ret = state->ParseFromFileDescriptor(meta_file_.GetNativeHandler());
-  meta_file_.Rewind();
-  return ret;
+  KRAFT_ASSERT1(state);
+  KRAFT_ASSERT(!meta_path_.empty(), "Init() must be called first");
+
+  auto loaded = RaftLogMetaRecord::Load(meta_path_);
+  if (loaded) {
+    PErrorSys(loaded.error());
+    return false;
+  }
+
+  *state = std::move(*loaded);
+  return true;
 }
 
 auto RaftLogManager::GetLastEntryMeta() -> EntryMeta

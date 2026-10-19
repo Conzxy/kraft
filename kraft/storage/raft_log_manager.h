@@ -7,7 +7,6 @@
 
 #include "kraft.pb.h"
 #include "kraft/macro.h"
-#include "kraft/storage/file.h"
 #include "kraft/storage/raft_log_segment.h"
 #include "kraft/storage/raft_log_segment_pool.h"
 #include "kraft/type.h"
@@ -70,7 +69,7 @@ class RaftLogManager {
   std::string cur_path_;
   RaftLogSegment cur_segment_;
 
-  File meta_file_;
+  std::string meta_path_;
 };
 
 using BpLog = RaftLogManager;
