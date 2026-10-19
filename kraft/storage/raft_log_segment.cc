@@ -86,9 +86,32 @@ auto RaftLogSegment::ParseLogName(std::string const &path, LogName *name) -> boo
   return true;
 }
 
-auto RaftLogSegment::CreateLoggingFile(std::string const &path)
-    -> ErrorOr<RaftLogSegment>
+auto RaftLogSegment::InitAsSealed(std::string const &path) -> Error
 {
+  KRAFT_ASSERT1(nullptr == file_.fp());
+
+  // A sealed segment must already exist; opening with "a+" would otherwise
+  // create an empty file.
+  if (0 != access(path.c_str(), F_OK)) {
+    errcode = E_OPEN_LOG_FILE;
+    return MakeMsgErrorf("The log file does not exist: %s", path.c_str());
+  }
+
+  FileWithMeta file;
+  if (!file.Open(path.c_str(), File::READ | File::APP | File::BIN)) {
+    errcode = E_OPEN_LOG_FILE;
+    return MakeMsgErrorf("Failed to open log file: %s", path.c_str());
+  }
+
+  Error err;
+  new (this) RaftLogSegment(std::move(file), OpenMode::kSealed, &err);
+  return err;
+}
+
+auto RaftLogSegment::InitAsLogging(std::string const &path) -> Error
+{
+  KRAFT_ASSERT1(nullptr == file_.fp());
+
   LogName log_name;
   if (!ParseLogName(path, &log_name) ||
       INVALID_INDEX != log_name.end_index)
@@ -97,69 +120,67 @@ auto RaftLogSegment::CreateLoggingFile(std::string const &path)
     return MakeMsgErrorf("The logging filename is invalid: %s", path.c_str());
   }
 
-  // Refuse to overwrite a non-empty file. A zero-length file is allowed: it is
-  // what a crash between file creation and header writing leaves behind.
-  const auto size = File::GetFileSize(path.c_str());
-  if (File::INVALID_RETURN != size && size > 0) {
-    errcode = E_OPEN_LOG_FILE;
-    return MakeMsgErrorf("The log file already exists and is not empty: %s",
-                         path.c_str());
-  }
-
-  // Use the same read+append mode as Init(): the segment keeps this handle and
-  // may still need to read the file after it is sealed and moved to the pool.
+  // Use read+append so the same handle can still read the file after it is
+  // sealed and moved to the pool.
   FileWithMeta file;
   if (!file.Open(path.c_str(), File::READ | File::APP | File::BIN)) {
     errcode = E_OPEN_LOG_FILE;
-    return MakeMsgErrorf("Failed to create the log file: %s", path.c_str());
+    return MakeMsgErrorf("Failed to open the log file: %s", path.c_str());
   }
 
-  u8 header[kFileHeaderSize] = {};
-  EncodeFileHeader(header);
-  if (file.Write(header, sizeof header) != sizeof header) {
-    errcode = E_WRITE_FILE;
-    return MakeMsgErrorf("Failed to write the log header: %s", path.c_str());
-  }
-  file.Flush();
-  if (!file.Fsync()) {
-    errcode = E_WRITE_FILE;
-    return MakeMsgErrorf("Failed to sync the log header: %s", path.c_str());
+  const auto file_size = file.GetFileSize();
+  if (File::INVALID_RETURN == file_size) {
+    errcode = E_READ_FILE;
+    return MakeMsgErrorf("Failed to get the size of log file: %s",
+                         path.c_str());
   }
 
-  RaftLogSegment segment;
-  segment.file_ = std::move(file);
-  segment.SetStartIndex(log_name.start_index);
-#ifndef NDEBUG
-  segment.is_readonly_ = false;
-#endif
+  if (file_size < kFileHeaderSize) {
+    if (0 != file_size) {
+      errcode = E_INVALID_LOG_VERSION;
+      return MakeMsgErrorf("The log file has an incomplete header: %s",
+                           path.c_str());
+    }
 
-  return segment;
+    // A missing or zero-length file starts with the file header. This is the
+    // only write performed by initialization.
+    u8 header[kFileHeaderSize] = {};
+    EncodeFileHeader(header);
+    if (file.Write(header, sizeof header) != sizeof header) {
+      errcode = E_WRITE_FILE;
+      return MakeMsgErrorf("Failed to write the log header: %s", path.c_str());
+    }
+    file.Flush();
+    if (!file.Fsync()) {
+      errcode = E_WRITE_FILE;
+      return MakeMsgErrorf("Failed to sync the log header: %s", path.c_str());
+    }
+  }
+
+  Error err;
+  new (this) RaftLogSegment(std::move(file), OpenMode::kLogging, &err);
+  return err;
 }
 
-RaftLogSegment::RaftLogSegment(char const *path, ReadOnlyFlag readonly,
-                               Error *error)
+RaftLogSegment::RaftLogSegment(FileWithMeta &&file, OpenMode mode, Error *error)
+  : file_(std::move(file))
 {
-  // Even readonly is enable, the mode also contains append
-  // since truncate may need swap the buffer to current buffer
-  // that is appendable.
-  //
-  // This is a internal class, this is safe for author(I think)!
-  int mode = File::BIN | File::READ | File::APP;
-
-#ifndef NDEBUG
-  is_readonly_ = (ReadOnlyFlag::ON == readonly);
-#endif
-
-  if (!file_.Open(path, mode)) {
-    *error = MakeMsgErrorf("Failed to open log file: %s", path);
-    kraft::errcode = E_OPEN_LOG_FILE;
-    return;
-  }
+  KRAFT_ASSERT1(error);
+  file_.Rewind();
 
   LogName log_name;
   if (!ParseLogName(file_.filename(), &log_name)) {
-    *error = MakeMsgErrorf("The log filename is invalid: %s", path);
-    kraft::errcode = E_INVALID_LOG_FILENAME;
+    *error = MakeMsgErrorf("The log filename is invalid: %s",
+                           file_.filename().c_str());
+    errcode = E_INVALID_LOG_FILENAME;
+    return;
+  }
+
+  const bool is_sealed_name = (INVALID_INDEX != log_name.end_index);
+  if ((OpenMode::kSealed == mode) != is_sealed_name) {
+    *error = MakeMsgErrorf("The log filename does not match its mode: %s",
+                           file_.filename().c_str());
+    errcode = E_INVALID_LOG_FILENAME;
     return;
   }
 
@@ -170,13 +191,13 @@ RaftLogSegment::RaftLogSegment(char const *path, ReadOnlyFlag readonly,
     return;
   }
 
-  if (ReadOnlyFlag::ON == readonly) {
-    KRAFT_ASSERT1(INVALID_INDEX != log_name.end_index);
+  if (OpenMode::kSealed == mode) {
     SetEntriesNum(log_name.end_index - log_name.start_index + 1);
-  } else if (INVALID_INDEX == log_name.end_index) {
-    // A logging segment is appendable and its entries live in memory. Recover
-    // the entries appended by a previous run as part of initialization; the
-    // Fetch methods are no-ops for logging segments.
+  } else {
+#ifndef NDEBUG
+    is_readonly_ = false;
+#endif
+    // Recover the entries appended by a previous run.
     Error load_error = LoadLoggingEntries();
     if (load_error) {
       *error = std::move(load_error);

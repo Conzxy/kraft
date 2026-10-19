@@ -79,13 +79,14 @@ auto RaftLogManager::Init(char const *dir_name, size_t segment_capa, size_t n)
     has_logging_file = true;
 
     cur_path_ = path;
-    if (auto err = cur_segment_.Init(cur_path_, ReadOnlyFlag::OFF)) {
-      // Keep the specific error from Init()/recovery if it set one.
+
+    // Creates the header for a crashed/empty file, otherwise recovers the
+    // entries appended by a previous run.
+    if (auto err = cur_segment_.InitAsLogging(cur_path_)) {
       if (E_OK == errcode) errcode = E_OPEN_LOGGING_FILE;
       return err;
     }
 
-    // Init() already recovered the entries appended by a previous run.
     cur_segment_.SetEntriesNum(segment_capa_);
   }
 
@@ -99,7 +100,6 @@ auto RaftLogManager::Init(char const *dir_name, size_t segment_capa, size_t n)
   // right after the last sealed segment ([start]-[end]), not at its start
   // index; the latter would overlap with the sealed data.
   if (!has_logging_file) {
-    Error err;
     u64 logging_start = 1;
     if (!idx_path_map_.empty()) {
       auto last_idx_path_iter = --idx_path_map_.end();
@@ -117,8 +117,8 @@ auto RaftLogManager::Init(char const *dir_name, size_t segment_capa, size_t n)
 
     const auto logging_path =
         MakeFullPath(RaftLogSegment::MakeLoggingName(logging_start));
-    err = cur_segment_.Init(logging_path, ReadOnlyFlag::OFF);
-    if (err) {
+    if (auto err = cur_segment_.InitAsLogging(logging_path)) {
+      PErrorSys(err);
       return err;
     }
     cur_segment_.SetEntriesNum(segment_capa_);
@@ -173,7 +173,7 @@ auto RaftLogManager::AppendEntry(Entry &entry) -> bool
     // Create the new segment before moving the old one into the pool, so a
     // failure here leaves the manager with a valid cur_segment_.
     RaftLogSegment new_segment;
-    if (auto err = new_segment.Init(new_name, ReadOnlyFlag::OFF)) {
+    if (auto err = new_segment.InitAsLogging(new_name)) {
       PErrorSys(err);
       return false;
     }

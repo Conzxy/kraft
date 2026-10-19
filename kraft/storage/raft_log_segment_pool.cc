@@ -44,7 +44,7 @@ auto RaftLogSegmentPool::GetLogSegment(std::string const &path)
   // Load before touching the pool: a failed load must not evict a cached
   // segment.
   RaftLogSegment new_segment;
-  if (auto error = new_segment.Init(path, ReadOnlyFlag::ON)) {
+  if (auto error = new_segment.InitAsSealed(path)) {
     return error;
   }
 

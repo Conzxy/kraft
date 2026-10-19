@@ -22,11 +22,11 @@ using kerror::ErrorOr;
 
 class RaftLogManager;
 
-DEFINE_BOOLEAN_ENUM_CLASS(ReadOnlyFlag);
-
 /**
  * A log segment storage that contains log entries.
- * It can be configed to readonly and read-and-appendonly
+ *
+ * A segment is either sealed (readonly) or logging (appendable). The two
+ * initialization entry points make that distinction explicit.
  */
 class RaftLogSegment {
   friend class RaftLogManager;
@@ -38,46 +38,27 @@ class RaftLogSegment {
   ~RaftLogSegment() noexcept;
 
   /**
-   * \brief
+   * \brief Open an existing sealed segment.
    *
-   * \param path
-   * \param readonly
-   *
-   * \return
+   * Fails if the file does not exist or its name is not a sealed name.
    *
    * \errcode
-   *  * E_OPEN_LOG_FILE
+   *  E_OPEN_LOG_FILE, E_INVALID_LOG_FILENAME, E_INVALID_LOG_VERSION,
+   *  E_READ_FILE
    */
-  Error Init(char const *path, ReadOnlyFlag readonly)
-  {
-    Error err;
-    new (this) RaftLogSegment(path, readonly, &err);
-    return err;
-  }
+  Error InitAsSealed(std::string const &path);
 
-  Error Init(std::string const &path, ReadOnlyFlag readonly)
-  {
-    Error err;
-    new (this) RaftLogSegment(path.c_str(), readonly, &err);
-    return err;
-  }
-
-  static ErrorOr<RaftLogSegment> Create(char const *path, ReadOnlyFlag readonly)
-  {
-    Error error;
-
-    RaftLogSegment ret(path, readonly, &error);
-    if (error) {
-      return error;
-    }
-    return ret;
-  }
-
-  KRAFT_INLINE static ErrorOr<RaftLogSegment> Create(std::string const &path,
-                                                    ReadOnlyFlag readonly)
-  {
-    return Create(path.c_str(), readonly);
-  }
+  /**
+   * \brief Open or create the appendable (logging) segment at @p path.
+   *
+   * A missing or zero-length file is created with a valid file header.
+   * An existing non-empty file is validated and its entries are recovered.
+   *
+   * \errcode
+   *  E_OPEN_LOG_FILE, E_INVALID_LOG_FILENAME, E_INVALID_LOG_VERSION,
+   *  E_READ_FILE, E_LOG_CHECKSUM_MISMATCH
+   */
+  Error InitAsLogging(std::string const &path);
 
   KRAFT_INLINE static std::string MakeLogName(char const *name_we)
   {
@@ -93,20 +74,6 @@ class RaftLogSegment {
   {
     return std::to_string(start_idx) + KRAFT_LOGGING_LOG_NAME_SUFFIX;
   }
-
-  /**
-   * \brief Create a new appendable segment and write its file header.
-   *
-   * Init() only opens existing files; creation is explicit so that a
-   * constructor/Init never writes to disk as a side effect.
-   *
-   * The returned segment keeps the file handle used to write the header, so
-   * the file is opened only once. Its entries are empty and its capacity is
-   * left to the caller (SetEntriesNum()).
-   *
-   * Fails if @p path already exists and is not empty.
-   */
-  static ErrorOr<RaftLogSegment> CreateLoggingFile(std::string const &path);
 
   // Upper bound of a serialized entry. It protects the reader from corrupted
   // size headers turning into huge allocations; real Raft entries are far
@@ -321,11 +288,23 @@ class RaftLogSegment {
     return self.substr(0, separator_pos + 1) + name;
   }
 
+  enum class OpenMode {
+    kSealed,
+    kLogging,
+  };
+
   /**
+   * \brief Adopt an already-open file.
+   *
+   * The file position is rewound and the header is checked. No file is opened
+   * or written here, so InitAsSealed()/InitAsLogging() can keep a single
+   * handle.
+   *
    * \warnign
-   *  Please call Init() to initialize the object
+   *  Please use InitAsSealed()/InitAsLogging() instead of constructing
+   *  directly.
    */
-  RaftLogSegment(char const *path, ReadOnlyFlag readonly, Error *err);
+  RaftLogSegment(FileWithMeta &&file, OpenMode mode, Error *err);
 
   std::vector<Entry> entries_;
   // The maximum (or expected) number of entries, NOT entries_.capacity().
