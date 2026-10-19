@@ -1,14 +1,35 @@
 // SPDX-LICENSE-IDENTIFIER: BSD-2-Clause
 #include "kraft/storage/raft_log_segment.h"
 
+#include <cstring>
 #include <numeric>
 #include <unistd.h>
 
 #include "kraft/error_code.h"
+#include "kraft/util/crc_codec_api.h"
+#include "kraft/util/little_endian_codec_api.h"
 #include "kraft/util/string_util.h"
 
 using namespace kraft;
 using namespace kerror;
+
+namespace {
+
+void EncodeFileHeader(u8 *out)
+{
+  le::EncodeU32(out, RaftLogSegment::kFileMagic);
+  le::EncodeU16(out + sizeof(u32), RaftLogSegment::kFileVersion);
+  le::EncodeU16(out + sizeof(u32) + sizeof(u16), 0);
+}
+
+bool IsValidFileHeader(u8 const *header)
+{
+  return le::DecodeU32(header) == RaftLogSegment::kFileMagic &&
+         le::DecodeU16(header + sizeof(u32)) == RaftLogSegment::kFileVersion &&
+         le::DecodeU16(header + sizeof(u32) + sizeof(u16)) == 0;
+}
+
+} // namespace
 
 RaftLogSegment::RaftLogSegment() noexcept {}
 
@@ -65,6 +86,56 @@ auto RaftLogSegment::ParseLogName(std::string const &path, LogName *name) -> boo
   return true;
 }
 
+auto RaftLogSegment::CreateLoggingFile(std::string const &path)
+    -> ErrorOr<RaftLogSegment>
+{
+  LogName log_name;
+  if (!ParseLogName(path, &log_name) ||
+      INVALID_INDEX != log_name.end_index)
+  {
+    errcode = E_INVALID_LOG_FILENAME;
+    return MakeMsgErrorf("The logging filename is invalid: %s", path.c_str());
+  }
+
+  // Refuse to overwrite a non-empty file. A zero-length file is allowed: it is
+  // what a crash between file creation and header writing leaves behind.
+  const auto size = File::GetFileSize(path.c_str());
+  if (File::INVALID_RETURN != size && size > 0) {
+    errcode = E_OPEN_LOG_FILE;
+    return MakeMsgErrorf("The log file already exists and is not empty: %s",
+                         path.c_str());
+  }
+
+  // Use the same read+append mode as Init(): the segment keeps this handle and
+  // may still need to read the file after it is sealed and moved to the pool.
+  FileWithMeta file;
+  if (!file.Open(path.c_str(), File::READ | File::APP | File::BIN)) {
+    errcode = E_OPEN_LOG_FILE;
+    return MakeMsgErrorf("Failed to create the log file: %s", path.c_str());
+  }
+
+  u8 header[kFileHeaderSize] = {};
+  EncodeFileHeader(header);
+  if (file.Write(header, sizeof header) != sizeof header) {
+    errcode = E_WRITE_FILE;
+    return MakeMsgErrorf("Failed to write the log header: %s", path.c_str());
+  }
+  file.Flush();
+  if (!file.Fsync()) {
+    errcode = E_WRITE_FILE;
+    return MakeMsgErrorf("Failed to sync the log header: %s", path.c_str());
+  }
+
+  RaftLogSegment segment;
+  segment.file_ = std::move(file);
+  segment.SetStartIndex(log_name.start_index);
+#ifndef NDEBUG
+  segment.is_readonly_ = false;
+#endif
+
+  return segment;
+}
+
 RaftLogSegment::RaftLogSegment(char const *path, ReadOnlyFlag readonly,
                                Error *error)
 {
@@ -93,6 +164,12 @@ RaftLogSegment::RaftLogSegment(char const *path, ReadOnlyFlag readonly,
   }
 
   SetStartIndex(log_name.start_index);
+
+  if (auto header_error = CheckFileHeader()) {
+    *error = std::move(header_error);
+    return;
+  }
+
   if (ReadOnlyFlag::ON == readonly) {
     KRAFT_ASSERT1(INVALID_INDEX != log_name.end_index);
     SetEntriesNum(log_name.end_index - log_name.start_index + 1);
@@ -108,7 +185,38 @@ RaftLogSegment::RaftLogSegment(char const *path, ReadOnlyFlag readonly,
   }
 }
 
-auto RaftLogSegment::ReadEntry(u64 expected_index,
+auto RaftLogSegment::CheckFileHeader() -> Error
+{
+  const auto file_size = file_.GetFileSize();
+  if (File::INVALID_RETURN == file_size) {
+    errcode = E_READ_FILE;
+    return MakeMsgErrorf("Failed to get the size of log file: %s",
+                         file_.filename().c_str());
+  }
+
+  if (file_size < kFileHeaderSize) {
+    errcode = E_INVALID_LOG_VERSION;
+    return MakeMsgErrorf(
+        "The log file is empty or its header is incomplete: %s",
+        file_.filename().c_str());
+  }
+
+  u8 header[kFileHeaderSize] = {};
+  const auto ret = file_.Read(header, sizeof header);
+  if (File::INVALID_RETURN == ret || ret < sizeof header) {
+    errcode = E_READ_FILE;
+    return MakeMsgErrorf("Failed to read the log header: %s",
+                         file_.filename().c_str());
+  }
+
+  if (!IsValidFileHeader(header)) {
+    errcode = E_INVALID_LOG_VERSION;
+    return MakeMsgErrorf("The log file has an unsupported version: %s",
+                         file_.filename().c_str());
+  }
+
+  return MakeSuccess();
+}
                                std::vector<unsigned char> *entry_buf,
                                EntryReadResult *result) -> Error
 {
@@ -207,6 +315,11 @@ auto RaftLogSegment::FetchEntriesBefore(u64 index) -> Error
   KRAFT_ASSERT1(index > start_index_ && index <= start_index_ + GetCapacitry());
   const auto num = index - start_index_;
 
+  // Always start at the first record; the caller's file position is not part
+  // of this method's contract.
+  entries_.clear();
+  file_.SeekBegin(kFileHeaderSize);
+
   std::vector<unsigned char> entry_buf;
   for (u64 i = 0; i < num; ++i) {
     const auto expected_index = start_index_ + i;
@@ -240,7 +353,7 @@ auto RaftLogSegment::LoadLoggingEntries() -> Error
   KRAFT_ASSERT1(has_valid_name && INVALID_INDEX == log_name.end_index);
 
   entries_.clear();
-  file_.Rewind();
+  file_.SeekBegin(kFileHeaderSize);
 
   const auto file_size = file_.GetFileSize();
   if (File::INVALID_RETURN == file_size) {
@@ -302,13 +415,8 @@ auto RaftLogSegment::FetchEntries() -> Error
     return MakeSuccess();
   }
 
-  // FetchEntries() reloads the entries from the file, so discard the in-memory
-  // entries and read from the beginning of the file. Otherwise, if the file
-  // was just written (e.g. AppendEntry()), the file position is at the end and
-  // no entry can be read.
-  entries_.clear();
-  file_.Rewind();
-
+  // FetchEntriesBefore() clears the in-memory entries and seeks past the file
+  // header, so the current file position does not matter here.
   if (auto err = FetchEntriesBefore(start_index_ + GetCapacitry())) return err;
 
   if (entries_.empty()) {
@@ -389,11 +497,12 @@ auto RaftLogSegment::TruncateAfter(u64 index, bool is_remove) -> Error
 
   if (is_remove) {
     auto truncated_size = std::accumulate(
-        entries_.begin(), entries_.end(), (size_t)0,
+        entries_.begin(), entries_.end(), kFileHeaderSize,
         [](size_t ret, Entry const &entry) {
-          return ret + entry.ByteSizeLong() + sizeof(size_header_t);
+          return ret + kRecordHeaderSize + entry.ByteSizeLong();
         });
-    if (0 != ftruncate(file_.GetNativeHandler(), truncated_size)) {
+    if (0 != ftruncate(file_.GetNativeHandler(),
+                       static_cast<off_t>(truncated_size))) {
       errcode = E_TRUNCATE;
       return MakeMsgErrorf("Failed to truncate file: %s to %zu bytes",
                            file_.filename().c_str(), truncated_size);

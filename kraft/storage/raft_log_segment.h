@@ -94,10 +94,40 @@ class RaftLogSegment {
     return std::to_string(start_idx) + KRAFT_LOGGING_LOG_NAME_SUFFIX;
   }
 
+  /**
+   * \brief Create a new appendable segment and write its file header.
+   *
+   * Init() only opens existing files; creation is explicit so that a
+   * constructor/Init never writes to disk as a side effect.
+   *
+   * The returned segment keeps the file handle used to write the header, so
+   * the file is opened only once. Its entries are empty and its capacity is
+   * left to the caller (SetEntriesNum()).
+   *
+   * Fails if @p path already exists and is not empty.
+   */
+  static ErrorOr<RaftLogSegment> CreateLoggingFile(std::string const &path);
+
   // Upper bound of a serialized entry. It protects the reader from corrupted
   // size headers turning into huge allocations; real Raft entries are far
   // smaller than this.
   static constexpr size_header_t kMaxEntrySize = 64u * 1024 * 1024;
+
+  // On-disk format (all integers are little-endian):
+  //
+  //   File header: [u32 magic][u16 version][u16 flags]
+  //   Record:      [u32 size][u32 crc32c][payload]
+  //
+  // size is the payload length. crc32c covers the encoded size field and the
+  // payload (the crc field itself is excluded).
+  // 
+  // FileHeader是kraft log file的metadata：
+  // - magic：识别raft log file
+  // - version：文件更迭用
+  // - flags：保留位，扩展用
+  static constexpr u32 kFileMagic = 0x5446524B; // bytes 'K' 'R' 'F' 'T'
+  static constexpr u16 kFileVersion = 1;
+  static constexpr size_t kFileHeaderSize = sizeof(u32) + 2 * sizeof(u16);
 
   struct LogName {
     u64 start_index = INVALID_INDEX;
@@ -240,6 +270,13 @@ class RaftLogSegment {
     kEof,
     kError,
   };
+
+  /**
+   * \brief Validate the segment file header.
+   *
+   * On success the file position is just after the header.
+   */
+  Error CheckFileHeader();
 
   /**
    * \brief Read, validate and append one entry.
