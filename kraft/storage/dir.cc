@@ -3,6 +3,7 @@
 #include <cassert>
 #include <cstdlib>
 #include <cstring>
+#include <unistd.h>
 
 #include "kraft/util/log.h"
 
@@ -77,6 +78,12 @@ bool Dir::ApplyDirEntries(ApplyDirEntryCallback apply_cb)
 
     apply_cb(DirEntry(*ent));
   }
+}
+
+bool Dir::Fsync() noexcept
+{
+  if (!dir_) return false;
+  return 0 == ::fsync(::dirfd(dir_));
 }
 
 auto kraft::MakeDir(char const *dir, int mode) -> bool

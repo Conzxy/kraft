@@ -16,6 +16,7 @@ file(GLOB_RECURSE
   storage/dir.cc
   storage/raft_log_segment_pool.cc
   storage/raft_log_manager.cc
+  storage/raft_log_meta_record.cc
   kraft.cc
   raft_driver.cc
   ${3_PARTY_DIR}/kerror/kerror.cc

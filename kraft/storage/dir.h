@@ -74,6 +74,14 @@ class Dir {
   bool ApplyDirEntry(ApplyDirEntryCallback apply_cb);
   bool ApplyDirEntries(ApplyDirEntryCallback apply_cb);
 
+  /**
+   * \brief Flush the directory's metadata.
+   *
+   * Call this after rename()/unlink() when the directory entry change must be
+   * durable.
+   */
+  bool Fsync() noexcept;
+
  private:
   DIR *dir_;
 };
