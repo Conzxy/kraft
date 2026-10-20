@@ -1207,6 +1207,75 @@ TEST(raft_driver, a_failed_application_does_not_advance_last_applied)
   EXPECT_EQ(node.log().applied_indices(), std::vector<u64>{1});
 }
 
+TEST(raft_driver, a_split_vote_needs_a_second_round_to_elect_a_leader)
+{
+  TestCluster cluster;
+  RaftDriver::Options const same_options{60, 20, 7};
+  cluster.AddNode(1, same_options);
+  cluster.AddNode(2, same_options);
+  cluster.AddNode(3, same_options);
+  cluster.ConnectAll();
+
+  // Arm all three drivers from the same clock with the same RNG seed, so their
+  // deadlines are identical and all three campaign in the same term.
+  cluster.TickNode(1);
+  cluster.TickNode(2);
+  cluster.TickNode(3);
+  cluster.DeliverAll();
+
+  const u64 first_deadline = cluster.At(1).driver->NextTimeoutMs();
+  ASSERT_EQ(first_deadline, cluster.At(2).driver->NextTimeoutMs());
+  ASSERT_EQ(first_deadline, cluster.At(3).driver->NextTimeoutMs());
+
+  cluster.Run(first_deadline);
+
+  // Each candidate voted only for itself and rejected the other two, so no one
+  // reaches the two votes a majority requires.
+  EXPECT_EQ(cluster.LeaderOf(), nullptr);
+  for (u64 id = 1; id <= 3; ++id) {
+    TestCluster::Node &node = cluster.At(id);
+    EXPECT_EQ(node.raft->term(), 1u) << "node " << id;
+    EXPECT_EQ(node.raft->role(), Raft::RaftRole::CANDIDATE) << "node " << id;
+    EXPECT_EQ(node.raft->voted_for(), id) << "node " << id;
+    EXPECT_TRUE(node.commits.empty()) << "node " << id;
+  }
+
+  const u64 second_deadline = cluster.At(1).driver->NextTimeoutMs();
+  ASSERT_EQ(second_deadline, cluster.At(2).driver->NextTimeoutMs());
+  ASSERT_EQ(second_deadline, cluster.At(3).driver->NextTimeoutMs());
+
+  // Only node 1 reaches the second deadline. Nodes 2 and 3 are still in term 1
+  // and grant their votes to its term-2 request, so it wins outright.
+  cluster.Advance(second_deadline);
+  cluster.TickNode(1);
+  cluster.DeliverAll();
+
+  TestCluster::Node *leader = cluster.LeaderOf();
+  ASSERT_NE(leader, nullptr);
+  EXPECT_EQ(leader->id, 1u);
+  EXPECT_EQ(leader->raft->term(), 2u);
+  EXPECT_EQ(leader->raft->role(), Raft::RaftRole::LEADER);
+  for (u64 id = 2; id <= 3; ++id) {
+    TestCluster::Node &follower = cluster.At(id);
+    EXPECT_EQ(follower.raft->term(), 2u) << "node " << id;
+    EXPECT_EQ(follower.raft->role(), Raft::RaftRole::FOLLOWER)
+        << "node " << id;
+    EXPECT_EQ(follower.raft->leader_id(), 1u) << "node " << id;
+  }
+
+  cluster.Run(100);
+  for (u64 id = 1; id <= 3; ++id) {
+    TestCluster::Node &node = cluster.At(id);
+    // The split round elected nobody, so the term-2 leader's no-op is index 1.
+    EXPECT_EQ(node.log->size(), 1u) << "node " << id;
+    EXPECT_EQ(node.raft->commit_index(), 1u) << "node " << id;
+    EXPECT_EQ(node.raft->last_applied(), 1u) << "node " << id;
+    EXPECT_EQ(node.log->applied_indices(), std::vector<u64>{1}) << "node " << id;
+    EXPECT_EQ(node.raft->term(), 2u) << "node " << id;
+  }
+  ASSERT_NE(cluster.LeaderOf(), nullptr);
+  EXPECT_EQ(cluster.LeaderOf()->id, 1u);
+}
 
 TEST(raft_driver, rejects_messages_that_fail_the_whitelist)
 {
