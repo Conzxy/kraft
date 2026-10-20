@@ -422,3 +422,31 @@ TEST_F(RaftLogSegmentValidationTest, does_not_truncate_checksum_mismatch)
   EXPECT_EQ(errcode, E_LOG_CHECKSUM_MISMATCH);
   EXPECT_EQ(fs::file_size(path), size_before);
 }
+
+TEST_F(RaftLogSegmentValidationTest, sealed_segment_rejects_writes)
+{
+  WriteRecords(Path("1-2.kraftlog"),
+               {MakeRecord(MakeEntry(1)), MakeRecord(MakeEntry(2))});
+
+  RaftLogSegment segment;
+  ASSERT_FALSE(segment.InitAsSealed(Path("1-2.kraftlog")));
+  EXPECT_TRUE(segment.IsSealed());
+
+  Entry entry = MakeEntry(3);
+  bool new_segment = false;
+  errcode = E_OK;
+  auto append_err = segment.AppendEntry(entry, &new_segment);
+  ASSERT_TRUE(append_err);
+  append_err.IgnoreCheck();
+  EXPECT_EQ(errcode, E_SEGMENT_READONLY);
+
+  errcode = E_OK;
+  auto truncate_err = segment.TruncateAfter(1, true);
+  ASSERT_TRUE(truncate_err);
+  truncate_err.IgnoreCheck();
+  EXPECT_EQ(errcode, E_SEGMENT_READONLY);
+
+  segment.SwitchToLogging();
+  EXPECT_TRUE(segment.IsLogging());
+  EXPECT_FALSE(segment.IsSealed());
+}

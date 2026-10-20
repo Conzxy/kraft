@@ -286,7 +286,6 @@ auto RaftLogManager::TruncateAfter(u64 index) -> bool
         PSysError("Failed to remove the old logging file");
         return false;
       }
-
       if (auto err = segment_pool_.RemoveSegment(first_segment_iter->second, index,
                                                TruncateFlag::ON))
       {
@@ -295,9 +294,9 @@ auto RaftLogManager::TruncateAfter(u64 index) -> bool
       }
 
       cur_segment_ = std::move(segment);
-#ifndef NDEBUG
-      cur_segment_.is_readonly_ = false;
-#endif
+
+      // This sealed segment is about to be truncated and promoted to the
+      // current logging segment.
       if (!cur_segment_.RenameToLogging()) {
         PSysError("Failed to rename the readonly segment to logging log");
         return false;

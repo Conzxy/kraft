@@ -104,7 +104,7 @@ auto RaftLogSegment::InitAsSealed(std::string const &path) -> Error
   }
 
   Error err;
-  new (this) RaftLogSegment(std::move(file), OpenMode::kSealed, &err);
+  new (this) RaftLogSegment(std::move(file), LogType::Sealed, &err);
   return err;
 }
 
@@ -158,12 +158,13 @@ auto RaftLogSegment::InitAsLogging(std::string const &path) -> Error
   }
 
   Error err;
-  new (this) RaftLogSegment(std::move(file), OpenMode::kLogging, &err);
+  new (this) RaftLogSegment(std::move(file), LogType::Logging, &err);
   return err;
 }
 
-RaftLogSegment::RaftLogSegment(FileWithMeta &&file, OpenMode mode, Error *error)
+RaftLogSegment::RaftLogSegment(FileWithMeta &&file, LogType type, Error *error)
   : file_(std::move(file))
+  , log_type_(type)
 {
   KRAFT_ASSERT1(error);
   file_.Rewind();
@@ -177,7 +178,7 @@ RaftLogSegment::RaftLogSegment(FileWithMeta &&file, OpenMode mode, Error *error)
   }
 
   const bool is_sealed_name = (INVALID_INDEX != log_name.end_index);
-  if ((OpenMode::kSealed == mode) != is_sealed_name) {
+  if ((LogType::Sealed == type) != is_sealed_name) {
     *error = MakeMsgErrorf("The log filename does not match its mode: %s",
                            file_.filename().c_str());
     errcode = E_INVALID_LOG_FILENAME;
@@ -191,12 +192,9 @@ RaftLogSegment::RaftLogSegment(FileWithMeta &&file, OpenMode mode, Error *error)
     return;
   }
 
-  if (OpenMode::kSealed == mode) {
+  if (LogType::Sealed == type) {
     SetEntriesNum(log_name.end_index - log_name.start_index + 1);
   } else {
-#ifndef NDEBUG
-    is_readonly_ = false;
-#endif
     // Recover the entries appended by a previous run.
     Error load_error = LoadLoggingEntries();
     if (load_error) {
@@ -501,13 +499,11 @@ auto RaftLogSegment::FetchEntries() -> Error
 
 auto RaftLogSegment::AppendEntry(Entry entry, bool *new_buffer) -> Error
 {
-#ifndef NDEBUG
-  if (is_readonly_) {
-    Panic("Readonly buffer can't append entry");
-    // dummy
-    return MakeSuccess();
+  if (LogType::Sealed == log_type_) {
+    errcode = E_SEGMENT_READONLY;
+    return MakeMsgErrorf("A sealed segment can't append entry: %s",
+                         file_.filename().c_str());
   }
-#endif
 
   if (!entry.has_index()) entry.set_index(1 + GetEndIndex());
   KRAFT_ASSERT1(new_buffer);
@@ -557,6 +553,7 @@ auto RaftLogSegment::AppendEntry(Entry entry, bool *new_buffer) -> Error
       return MakeMsgErrorf("Failed to rename the logging file '%s' to '%s'",
                            file_.filename().c_str(), new_name.c_str());
     }
+    SwitchToSealed();
     *new_buffer = true;
   }
   return MakeSuccess();
@@ -564,6 +561,12 @@ auto RaftLogSegment::AppendEntry(Entry entry, bool *new_buffer) -> Error
 
 auto RaftLogSegment::TruncateAfter(u64 index, bool is_remove) -> Error
 {
+  if (LogType::Sealed == log_type_) {
+    errcode = E_SEGMENT_READONLY;
+    return MakeMsgErrorf("A sealed segment can't be truncated: %s",
+                         file_.filename().c_str());
+  }
+
   KRAFT_ASSERT(index >= start_index_ - 1 &&
                    index <= start_index_ + has_logged_num() - 1,
                "The index is out of range, can't to truncate");

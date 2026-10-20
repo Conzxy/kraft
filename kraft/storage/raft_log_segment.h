@@ -34,8 +34,36 @@ class RaftLogSegment {
   using Entries = std::vector<Entry>;
 
  public:
+  enum class LogType {
+    Logging,
+    Sealed,
+  };
+
   RaftLogSegment() noexcept;
   ~RaftLogSegment() noexcept;
+
+  KRAFT_INLINE LogType GetLogType() const noexcept { return log_type_; }
+  KRAFT_INLINE bool IsLogging() const noexcept
+  {
+    return LogType::Logging == log_type_;
+  }
+  KRAFT_INLINE bool IsSealed() const noexcept
+  {
+    return LogType::Sealed == log_type_;
+  }
+
+  /**
+   * \brief Switch the segment state after the backing file was promoted.
+   */
+  KRAFT_INLINE void SwitchToLogging() noexcept
+  {
+    log_type_ = LogType::Logging;
+  }
+
+  /**
+   * \brief Switch the segment state after the backing file was sealed.
+   */
+  KRAFT_INLINE void SwitchToSealed() noexcept { log_type_ = LogType::Sealed; }
 
   /**
    * \brief Open an existing sealed segment.
@@ -229,7 +257,11 @@ class RaftLogSegment {
     // Rename in the same directory as the current file. Never rely on the
     // process working directory.
     const auto new_name = MakeSiblingPath(MakeLoggingName(start_index_));
-    return file_.Rename(new_name.c_str());
+    if (!file_.Rename(new_name.c_str())) {
+      return false;
+    }
+    SwitchToLogging();
+    return true;
   }
 
  private:
@@ -292,11 +324,6 @@ class RaftLogSegment {
     return self.substr(0, separator_pos + 1) + name;
   }
 
-  enum class OpenMode {
-    kSealed,
-    kLogging,
-  };
-
   /**
    * \brief Adopt an already-open file.
    *
@@ -308,17 +335,14 @@ class RaftLogSegment {
    *  Please use InitAsSealed()/InitAsLogging() instead of constructing
    *  directly.
    */
-  RaftLogSegment(FileWithMeta &&file, OpenMode mode, Error *err);
+  RaftLogSegment(FileWithMeta &&file, LogType type, Error *err);
 
   std::vector<Entry> entries_;
   // The maximum (or expected) number of entries, NOT entries_.capacity().
   size_t max_entries_ = 0;
   u64 start_index_;
   FileWithMeta file_;
-
-#ifndef NDEBUG
-  bool is_readonly_ = true;
-#endif
+  LogType log_type_ = LogType::Sealed;
 };
 
 } // namespace kraft

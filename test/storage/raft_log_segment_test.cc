@@ -92,6 +92,7 @@ TEST(raft_log_segment, fetch_entries)
 TEST(raft_log_segment, truncate)
 {
   ASSERT_FALSE(buffer.FetchEntries());
+  ASSERT_TRUE(buffer.RenameToLogging());
   ASSERT_FALSE(buffer.TruncateAfter(4, true));
 
   for (auto i = buffer.GetStartIndex(); i < buffer.GetEndIndex(); ++i) {
