@@ -63,6 +63,9 @@ class MemoryLog {
   // already been given the index it must land on.
   bool Append(Entry &entry)
   {
+    if (fail_append_) {
+      return false;
+    }
     if (entry.index() != entries_.size() + 1) {
       ADD_FAILURE() << "appended entry index " << entry.index()
                     << " does not follow the last index " << entries_.size();
@@ -125,12 +128,26 @@ class MemoryLog {
 
   bool Apply(Entry const *entry)
   {
+    if (fail_apply_) {
+      return false;
+    }
     applied_.push_back(*entry); // a copy: the pointer only lives for the call
     applied_indices_.push_back(entry->index());
     return true;
   }
+
+  void SetFailAppend(bool fail) noexcept { fail_append_ = fail; }
+
+  void SetFailApply(bool fail) noexcept { fail_apply_ = fail; }
+
   bool has_persisted() const noexcept { return has_persisted_; }
 
+  // Simulates an application that starts empty and must replay from index 1.
+  void ResetApplied()
+  {
+    applied_.clear();
+    applied_indices_.clear();
+  }
 
   /*----------------- test accessors -----------------*/
 
@@ -159,6 +176,8 @@ class MemoryLog {
   std::vector<Entry> applied_;
   PersistentState persisted_;
   bool has_persisted_ = false;
+  bool fail_append_ = false;
+  bool fail_apply_ = false;
 };
 
 /*--------------------------------------------------*/
@@ -450,6 +469,14 @@ class TestCluster {
       node->driver->Tick();
     }
   }
+
+  // Tick exactly one node. Together with Advance() this lets a test let one
+  // deadline fire while the others stand still, which is how a deterministic
+  // split vote is created.
+  void TickNode(u64 id) { At(id).driver->Tick(); }
+
+  // Move the shared clock without ticking any driver.
+  void Advance(u64 delta_ms) noexcept { now_ms_ += delta_ms; }
 
   // Advances the clock in steps and lets the state machine settle after each
   // one. The driver derives its deadlines reactively, so a single large jump
@@ -1119,6 +1146,65 @@ TEST(raft_driver, recover_requires_a_persistent_state_reader)
                          "Recover without log_get_state_cb_");
   EXPECT_EQ(raft.id(), INVALID_ID);
   EXPECT_EQ(raft.term(), 0u);
+}
+
+TEST(raft_driver, append_log_reports_a_storage_failure)
+{
+  SingleNode node(1);
+  RaftDriver driver(node.raft(), FastOptions(1));
+
+  const u64 wait = driver.Tick();
+  ASSERT_GE(wait, 60u);
+  ASSERT_LT(wait, 120u);
+  node.Advance(wait);
+  driver.Tick();
+  ASSERT_TRUE(node.raft().IsLeader());
+  ASSERT_EQ(node.log().size(), 1u);
+
+  node.log().SetFailAppend(true);
+  TestCluster::ExpectErr(node.raft().AppendLog("x", 1),
+                         E_LOG_APPEND_ENTRY, "failing AppendLog");
+  EXPECT_EQ(node.log().size(), 1u);
+
+  // A storage failure is not a poisoned instance: clearing it lets the next
+  // append use the same index again.
+  node.log().SetFailAppend(false);
+  TestCluster::ExpectOk(node.raft().AppendLog("x", 1), "AppendLog after retry");
+  EXPECT_EQ(node.log().size(), 2u);
+  EXPECT_EQ(node.log().data_at(2), "x");
+}
+
+TEST(raft_driver, a_failed_application_does_not_advance_last_applied)
+{
+  SingleNode node(1);
+  RaftDriver driver(node.raft(), FastOptions(1));
+
+  const u64 wait = driver.Tick();
+  ASSERT_GE(wait, 60u);
+  ASSERT_LT(wait, 120u);
+  node.Advance(wait);
+  driver.Tick();
+  ASSERT_TRUE(node.raft().IsLeader());
+  ASSERT_EQ(node.raft().commit_index(), 0u);
+
+  node.log().SetFailApply(true);
+  driver.Tick();
+
+  // The leader may advance the commit index, but application is all-or-nothing
+  // per entry: last_applied_ must not skip the failed entry.
+  EXPECT_EQ(node.raft().commit_index(), 1u);
+  EXPECT_EQ(node.raft().last_applied(), 0u);
+  EXPECT_TRUE(node.log().applied_indices().empty());
+
+  driver.Tick(); // still failing: no progress, and no double apply
+  EXPECT_EQ(node.raft().commit_index(), 1u);
+  EXPECT_EQ(node.raft().last_applied(), 0u);
+  EXPECT_TRUE(node.log().applied_indices().empty());
+
+  node.log().SetFailApply(false);
+  driver.Tick();
+  EXPECT_EQ(node.raft().last_applied(), 1u);
+  EXPECT_EQ(node.log().applied_indices(), std::vector<u64>{1});
 }
 
 
