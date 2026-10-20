@@ -39,6 +39,9 @@ class MemoryLog {
     raft->log_set_state_ = [this](PersistentState const &state) {
       return SetState(state);
     };
+    raft->log_get_state_cb_ = [this](PersistentState *state) {
+      return GetState(state);
+    };
     raft->log_get_last_entry_meta_cb_ = [this] { return LastEntryMeta(); };
     raft->log_get_entry_meta_cb_ = [this](u64 index) {
       return EntryTerm(index);
@@ -72,6 +75,16 @@ class MemoryLog {
   bool SetState(PersistentState const &state)
   {
     persisted_ = state;
+    has_persisted_ = true;
+    return true;
+  }
+
+  bool GetState(PersistentState *state)
+  {
+    if (!has_persisted_) {
+      return false; // a brand-new node has nothing to recover
+    }
+    *state = persisted_;
     return true;
   }
 
@@ -116,6 +129,8 @@ class MemoryLog {
     applied_indices_.push_back(entry->index());
     return true;
   }
+  bool has_persisted() const noexcept { return has_persisted_; }
+
 
   /*----------------- test accessors -----------------*/
 
@@ -143,6 +158,7 @@ class MemoryLog {
   std::vector<u64> applied_indices_;
   std::vector<Entry> applied_;
   PersistentState persisted_;
+  bool has_persisted_ = false;
 };
 
 /*--------------------------------------------------*/
@@ -279,6 +295,71 @@ class TestCluster {
         EXPECT_TRUE(node->raft->AddPeerNode(peer->id, peer.get()));
       }
     }
+  }
+
+  // Reconnect a restarted node to the peers that survived it. The peers still
+  // hold a ctx pointing at this same Node object, so only this side is missing
+  // its routing table.
+  void ConnectNode(u64 id)
+  {
+    Node *node = Find(id);
+    if (node == nullptr) {
+      ADD_FAILURE() << "no node with id " << id;
+      return;
+    }
+    for (auto &peer : nodes_) {
+      if (peer.get() == node) {
+        continue;
+      }
+      EXPECT_TRUE(node->raft->AddPeerNode(peer->id, peer.get()));
+    }
+  }
+
+  // Destroys a node's driver and instance, then brings them back on top of the
+  // same MemoryLog. The log outlives the instance, exactly like a real
+  // persistent storage layer.
+  Node *RestartNode(u64 id, RaftDriver::Options options)
+  {
+    Node *node = Find(id);
+    if (node == nullptr) {
+      ADD_FAILURE() << "no node with id " << id;
+      return nullptr;
+    }
+
+    // Driver first: it references the instance. Then the instance, so the log
+    // can be installed into the new one.
+    node->driver.reset();
+    node->raft.reset();
+    node->role_changes.clear();
+    node->commits.clear();
+    // The commit index is not persisted, so a restarted application re-applies
+    // from index 1. Start it empty to observe that replay.
+    node->log->ResetApplied();
+
+    node->raft.reset(new Raft(0));
+    node->raft->log_cb_ = [node](char const *data, size_t n) {
+      std::string s(data, n);
+      printf("raft[%llu]: %s\n", (ull)node->id, s.c_str());
+    };
+    node->raft->SetClock([this] { return now_ms_; });
+    // Install() also installs log_get_state_cb_, which Recover() reads.
+    node->log->Install(node->raft.get());
+
+    // Recover() must run before AddSelfNode(): AddSelfNode() persists an
+    // identity and would overwrite the term/vote that is being recovered.
+    ExpectOk(node->raft->Recover(id), "Recover");
+    EXPECT_TRUE(node->raft->AddSelfNode(id, node));
+
+    node->raft->send_message_cb_ = [this](::google::protobuf::Message *msg,
+                                         void *user_ctx) {
+      Post(*static_cast<Message *>(msg), static_cast<Node *>(user_ctx));
+    };
+    node->driver.reset(new RaftDriver(*node->raft, options));
+    node->driver->OnRoleChange([node](Raft::RaftRole state) {
+      node->role_changes.push_back(state);
+    });
+    node->driver->OnCommit([node](u64 index) { node->commits.push_back(index); });
+    return node;
   }
 
   /*----------------- network -----------------*/
@@ -951,6 +1032,95 @@ TEST(raft_driver, isolated_leader_steps_down_and_truncates_its_conflict)
     EXPECT_EQ(node.raft->commit_index(), fresh_index) << "node " << id;
   }
 }
+
+TEST(raft_driver, a_restarted_follower_recovers_its_state_and_replays_the_log)
+{
+  TestCluster cluster;
+  cluster.AddNode(1, FastOptions(1));
+  cluster.AddNode(2, SlowOptions(2));
+  cluster.AddNode(3, SlowOptions(3));
+  cluster.ConnectAll();
+  cluster.Run(400);
+
+  ASSERT_NE(cluster.LeaderOf(), nullptr);
+  TestCluster::ExpectOk(cluster.At(1).raft->AppendLog("a", 1), "AppendLog a");
+  TestCluster::ExpectOk(cluster.At(1).raft->AppendLog("b", 1), "AppendLog b");
+  cluster.Run(100);
+
+  TestCluster::Node &before = cluster.At(3);
+  ASSERT_EQ(before.raft->commit_index(), 3u);
+  ASSERT_EQ(before.raft->last_applied(), 3u);
+  ASSERT_EQ(before.log->size(), 3u);
+  const u64 persisted_term = before.raft->term();
+  const u64 persisted_vote = before.raft->voted_for();
+  ASSERT_TRUE(before.log->has_persisted());
+
+  // The log outlives the instance: the restarted one must recover the term and
+  // vote from it, then replay what it had already applied.
+  TestCluster::Node *restarted = cluster.RestartNode(3, SlowOptions(3));
+  ASSERT_NE(restarted, nullptr);
+
+  EXPECT_EQ(restarted->raft->id(), 3u);
+  EXPECT_EQ(restarted->raft->term(), persisted_term);
+  EXPECT_EQ(restarted->raft->voted_for(), persisted_vote);
+  EXPECT_EQ(restarted->raft->role(), Raft::RaftRole::FOLLOWER);
+  EXPECT_EQ(restarted->raft->commit_index(), 0u); // not persisted
+  EXPECT_EQ(restarted->raft->last_applied(), 0u);
+  EXPECT_EQ(restarted->log->size(), 3u);
+  EXPECT_TRUE(restarted->role_changes.empty());
+  EXPECT_TRUE(restarted->commits.empty());
+
+  cluster.ConnectNode(3);
+  cluster.Run(100);
+
+  EXPECT_EQ(restarted->raft->commit_index(), 3u);
+  EXPECT_EQ(restarted->raft->last_applied(), 3u);
+  EXPECT_EQ(restarted->log->applied_indices(), (std::vector<u64>{1, 2, 3}));
+  ASSERT_EQ(restarted->log->applied().size(), 3u);
+  EXPECT_EQ(restarted->log->applied()[1].data(), "a");
+  EXPECT_EQ(restarted->log->applied()[2].data(), "b");
+  EXPECT_EQ(restarted->raft->term(), persisted_term);
+  EXPECT_EQ(restarted->raft->leader_id(), 1u);
+  EXPECT_TRUE(restarted->role_changes.empty());
+  ASSERT_NE(cluster.LeaderOf(), nullptr);
+  EXPECT_EQ(cluster.LeaderOf()->id, 1u);
+}
+
+TEST(raft_driver, recover_rejects_a_persistent_state_for_another_node)
+{
+  MemoryLog log;
+  {
+    Raft original(0);
+    log.Install(&original);
+    ASSERT_TRUE(original.AddSelfNode(1, nullptr));
+    ASSERT_TRUE(log.has_persisted());
+  }
+
+  Raft restarted(0);
+  log.Install(&restarted);
+
+  TestCluster::ExpectErr(restarted.Recover(2), E_INCORRECT_STATE,
+                         "Recover as the wrong node");
+  EXPECT_EQ(restarted.id(), INVALID_ID);
+  EXPECT_EQ(restarted.term(), 0u);
+
+  // The failed attempt did not consume the one-shot recovery.
+  TestCluster::ExpectOk(restarted.Recover(1), "Recover as the right node");
+  EXPECT_EQ(restarted.id(), 1u);
+  EXPECT_EQ(restarted.term(), 0u);
+  EXPECT_EQ(restarted.voted_for(), INVALID_VOTED_FOR);
+  EXPECT_TRUE(restarted.AddSelfNode(1, nullptr));
+}
+
+TEST(raft_driver, recover_requires_a_persistent_state_reader)
+{
+  Raft raft(0);
+  TestCluster::ExpectErr(raft.Recover(1), E_INCORRECT_STATE,
+                         "Recover without log_get_state_cb_");
+  EXPECT_EQ(raft.id(), INVALID_ID);
+  EXPECT_EQ(raft.term(), 0u);
+}
+
 
 TEST(raft_driver, rejects_messages_that_fail_the_whitelist)
 {
